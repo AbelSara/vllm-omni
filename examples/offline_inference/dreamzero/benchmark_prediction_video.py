@@ -10,7 +10,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -62,6 +62,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Total action-producing generate calls, including the initial single-frame request.",
     )
     parser.add_argument("--fps", type=_positive_int, default=5, help="Playback FPS for written videos.")
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
+    parser.add_argument(
+        "--profile-request-index",
+        type=_non_negative_int,
+        default=1,
+        help="Generate request index to profile when --profiler-config is set. Default profiles chunk_0.",
+    )
     parser.add_argument("--save-gif", action="store_true")
     parser.add_argument("--save-input-video", action="store_true")
     parser.add_argument("--save-side-by-side", action="store_true")
@@ -80,10 +92,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {exc}") from exc
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
     return parsed
 
 
@@ -211,21 +240,36 @@ def _run_generation(
     model: str,
     deploy_config_path: Path,
     observations: Sequence[dict],
+    *,
+    profiler_config: dict[str, Any] | None = None,
+    profile_request_index: int | None = None,
 ):
     from vllm_omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    if (
+        profiler_config is not None
+        and profile_request_index is not None
+        and profile_request_index >= len(observations)
+    ):
+        raise ValueError(
+            f"--profile-request-index={profile_request_index} is outside "
+            f"the {len(observations)} generated requests."
+        )
 
     omni = Omni(
         model=model,
         deploy_config=str(deploy_config_path),
         enforce_eager=True,
         worker_extension_cls=WORKER_EXTENSION,
+        profiler_config=profiler_config,
     )
 
     actions: list[np.ndarray] = []
     latent_steps = []
     request_timings: list[benchmark_utils.RequestTiming] = []
     for index, obs in enumerate(observations):
+        profile_this_request = profiler_config is not None and index == profile_request_index
         sampling_params = OmniDiffusionSamplingParams(
             extra_args={
                 "reset": index == 0,
@@ -233,9 +277,18 @@ def _run_generation(
                 "robot_obs": obs,
             }
         )
+        if profile_this_request:
+            print(f"[Profiler] Starting profiling before request {index}...", flush=True)
+            omni.start_profile()
         start = time.perf_counter()
-        result = omni.generate(obs["prompt"], sampling_params_list=[sampling_params])
-        latency_s = time.perf_counter() - start
+        try:
+            result = omni.generate(obs["prompt"], sampling_params_list=[sampling_params])
+        finally:
+            latency_s = time.perf_counter() - start
+            if profile_this_request:
+                print(f"[Profiler] Stopping profiler after request {index}...", flush=True)
+                profile_results = omni.stop_profile()
+                _print_profile_results(profile_results)
         if not result:
             raise RuntimeError(f"No output returned for DreamZero request {index}")
 
@@ -262,6 +315,19 @@ def _run_generation(
         )
 
     return omni, actions, latent_steps, request_timings
+
+
+def _print_profile_results(profile_results: object) -> None:
+    if profile_results and isinstance(profile_results, dict):
+        traces = profile_results.get("traces", [])
+        print("PROFILING_RESULTS:", flush=True)
+        for rank, trace in enumerate(traces):
+            if trace:
+                print(f"  rank{rank}: {trace}", flush=True)
+        if not traces:
+            print("  no traces collected", flush=True)
+    else:
+        print("[Profiler] No valid profiling data returned.", flush=True)
 
 
 def _decode_with_worker(omni, full_latents) -> np.ndarray:
@@ -393,6 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=args.model,
             deploy_config_path=args.deploy_config,
             observations=observations,
+            profiler_config=args.profiler_config,
+            profile_request_index=args.profile_request_index,
         )
         import torch
 

@@ -122,6 +122,30 @@ environment already sets another backend.
 | `--save-gif` | off | Also write a GIF of the prediction. |
 | `--reference-actions` | unset | Compare generated actions with a previous NPZ. |
 | `--accuracy-atol` | `1e-3` | Max absolute action error allowed for reference comparison. |
+| `--profiler-config` | unset | JSON `ProfilerConfig` for torch/cuda profiling. Diagnostic only. |
+| `--profile-request-index` | `1` | Request index profiled when `--profiler-config` is set. The default profiles `chunk_0` after the initial request. |
+
+## One-Chunk Torch Profiler
+
+Use torch profiler only for diagnosis. Keep the normal benchmark run without
+profiler as the source of latency/FPS numbers, then run one profiled request to
+inspect operator and communication breakdown:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+NCCL_IB_DISABLE=1 \
+CUDA_VISIBLE_DEVICES=1,2 \
+python examples/offline_inference/dreamzero/benchmark_prediction_video.py \
+  --deploy-config /tmp/dreamzero_tp2_cfg1.yaml \
+  --output-dir /tmp/dreamzero_profile/output_gpu1_2 \
+  --output-stem tp2_cfg1_profile_gpu1_2 \
+  --profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/dreamzero_profile/tp2_cfg1_gpu1_2","torch_profiler_use_gzip":false,"torch_profiler_record_shapes":true,"torch_profiler_with_stack":false,"torch_profiler_with_memory":false,"torch_profiler_with_flops":false,"torch_profiler_dump_cuda_time_total":true,"delay_iterations":0,"max_iterations":0,"wait_iterations":0,"warmup_iterations":0,"active_iterations":1}' \
+  --profile-request-index 1
+```
+
+`--profile-request-index 1` starts profiling after the initial request and stops
+immediately after `chunk_0`, so model loading and session setup stay out of the
+trace.
 
 ## Output
 
@@ -190,3 +214,28 @@ Action comparison between TP2/CFG1 and TP1/CFG1 baseline at `atol=1e-3`:
 | ---: | --- | ---: | ---: | --- |
 | 0 | 24x8 | 0.06497 | 0.01822 | no |
 | 1 | 24x8 | 0.00821 | 0.00224 | no |
+
+## TP vs CFG Diagnostic Result
+
+Measured on June 5, 2026 on GPUs `1,2` with `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`.
+Baseline latency/FPS below is from non-profiler runs; breakdown is from a
+separate one-chunk torch profiler run.
+
+| Mode | First latency | Steady chunk latency | Total generate | Model video FPS | Model action Hz |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TP2 CFG1 | 7.652s | 7.604s | 15.256s | 1.114 | 3.146 |
+| TP1 CFG2 | 4.582s | 4.033s | 8.615s | 1.973 | 5.572 |
+
+Critical-rank one-chunk breakdown:
+
+| Mode | GPU compute | GPU communication | CPU wait / launch gap |
+| --- | ---: | ---: | ---: |
+| TP2 CFG1 | 4.211s / 60.7% | 2.326s / 33.5% | 0.405s / 5.8% |
+| TP1 CFG2 | 3.663s / 88.1% | 0.231s / 5.6% | 0.264s / 6.3% |
+
+Action parity against the TP1/CFG1 baseline:
+
+| Mode | Chunk 0 max abs error | Chunk 1 max abs error | Passed `atol=1e-3` |
+| --- | ---: | ---: | --- |
+| TP1 CFG2 | 0.0 | 0.0 | yes |
+| TP2 CFG1 | 0.06497 | 0.00821 | no |
