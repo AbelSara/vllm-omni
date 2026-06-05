@@ -4,8 +4,9 @@ This directory contains a small offline benchmark for DreamZero. It runs local
 `Omni` inference, measures per-request generation latency, decodes the predicted
 video latents, and writes artifacts for visual and numeric checks.
 
-The playback `--fps` option only controls the MP4/GIF frame rate. The real
-inference FPS is reported in the JSON summary as `model_video_fps`.
+The written MP4/GIF files default to 5 FPS for playback. This playback metadata
+does not affect latency or throughput; real inference FPS is reported in the
+JSON summary as `model_video_fps`.
 
 ## Assets
 
@@ -75,7 +76,6 @@ environment already sets another backend.
 | `--model` | `GEAR-Dreams/DreamZero-DROID` | Hugging Face model id or local model path. |
 | `--video-dir` | `outputs/dreamzero/assets` | Directory with the three camera MP4 files. |
 | `--num-requests` | `2` | Total generate calls, including the initial request. |
-| `--fps` | `5` | Playback FPS for written video files, not inference FPS. |
 | `--save-input-video` | off | Also write the stitched input camera video. |
 | `--save-side-by-side` | off | Write input and prediction side by side. |
 | `--save-gif` | off | Also write a GIF of the prediction. |
@@ -90,6 +90,9 @@ For `--output-stem dreamzero_gpu1_2_tp1_cfg2`, the benchmark writes:
 - `outputs/dreamzero/benchmark/dreamzero_gpu1_2_tp1_cfg2_side_by_side.mp4`
 - `outputs/dreamzero/benchmark/dreamzero_gpu1_2_tp1_cfg2_actions.npz`
 - `outputs/dreamzero/benchmark/dreamzero_gpu1_2_tp1_cfg2_summary.json`
+
+The saved video files use 5 FPS playback by default. Change `--fps` only if you
+want a different playback speed for visual inspection.
 
 Useful summary fields:
 
