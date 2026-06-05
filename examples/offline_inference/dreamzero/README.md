@@ -51,6 +51,47 @@ python examples/offline_inference/dreamzero/benchmark_prediction_video.py \
   --save-side-by-side
 ```
 
+Two-GPU tensor-parallel run. The PR does not add a bundled TP2 deploy file; use
+an equivalent local YAML for benchmarking:
+
+```yaml
+# /tmp/dreamzero_tp2_cfg1.yaml
+pipeline: dreamzero
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    parallel_config:
+      tensor_parallel_size: 2
+      cfg_parallel_size: 1
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position
+```
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+NCCL_IB_DISABLE=1 \
+CUDA_VISIBLE_DEVICES=1,3 \
+python examples/offline_inference/dreamzero/benchmark_prediction_video.py \
+  --deploy-config /tmp/dreamzero_tp2_cfg1.yaml \
+  --output-dir outputs/dreamzero/benchmark \
+  --output-stem dreamzero_gpu1_3_tp2_cfg1 \
+  --save-side-by-side
+```
+
 Optional action parity check against a previous run:
 
 ```bash
@@ -114,6 +155,7 @@ Measured on June 5, 2026 with:
 - GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, driver `590.48.01`
 - TP1/CFG2 run used GPUs `1,2`
 - TP1/CFG1 baseline used GPU `1`
+- TP2/CFG1 run used GPUs `1,3`; GPU `2` was busy during this run
 - CPU: 2x AMD EPYC 9355 32-Core Processor, 128 logical CPUs
 - Host memory: 1.5 TiB
 - Backend: `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA`
@@ -123,6 +165,7 @@ Measured on June 5, 2026 with:
 | Mode | GPUs | First latency | Steady latency | Total generate | Decode | Model video FPS | Model+decode video FPS | Model action Hz |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | TP1 CFG1 | 1 | 7.434s | 8.047s | 15.481s | 0.411s | 1.098 | 1.070 | 3.101 |
+| TP2 CFG1 | 2 | 7.528s | 7.676s | 15.205s | 0.402s | 1.118 | 1.089 | 3.157 |
 | TP1 CFG2 | 2 | 4.655s | 4.102s | 8.758s | 0.411s | 1.941 | 1.854 | 5.481 |
 
 The generated prediction videos were readable by OpenCV:
@@ -131,6 +174,8 @@ The generated prediction videos were readable by OpenCV:
 | --- | ---: | ---: | --- |
 | `dreamzero_gpu1_2_tp1_cfg2.mp4` | 17 | 5.0 | 640x352 |
 | `dreamzero_gpu1_2_tp1_cfg2_side_by_side.mp4` | 17 | 5.0 | 1280x352 |
+| `dreamzero_gpu1_3_tp2_cfg1.mp4` | 17 | 5.0 | 640x352 |
+| `dreamzero_gpu1_3_tp2_cfg1_side_by_side.mp4` | 17 | 5.0 | 1280x352 |
 
 Action parity check between TP1/CFG2 and TP1/CFG1 baseline:
 
@@ -138,3 +183,10 @@ Action parity check between TP1/CFG2 and TP1/CFG1 baseline:
 | ---: | --- | ---: | ---: | --- |
 | 0 | 24x8 | 0.0 | 0.0 | yes |
 | 1 | 24x8 | 0.0 | 0.0 | yes |
+
+Action comparison between TP2/CFG1 and TP1/CFG1 baseline at `atol=1e-3`:
+
+| Chunk | Shape | Max abs error | RMSE | Passed |
+| ---: | --- | ---: | ---: | --- |
+| 0 | 24x8 | 0.06497 | 0.01822 | no |
+| 1 | 24x8 | 0.00821 | 0.00224 | no |
