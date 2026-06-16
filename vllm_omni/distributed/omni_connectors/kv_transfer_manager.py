@@ -535,17 +535,6 @@ class OmniKVTransferManager:
 
     get_connector = property(lambda self: self.connector)
 
-    @property
-    def kv_topology_rank_aware(self) -> bool:
-        """True when the KV transfer topology uses per-rank recv keys.
-
-        In this mode every rank receives its own shard independently (no
-        collectives), which is what makes background prefetch safe to run
-        per-rank.
-        """
-        topo = self._tp_topo
-        return topo.source_tp_size > 1 or topo.target_tp_size > 1
-
     def _recv_role(self) -> ReceiveRole:
         """Classify how this rank obtains KV under the current parallel topology.
 
@@ -561,9 +550,6 @@ class OmniKVTransferManager:
             get_world_group,
         )
 
-        # Absent parallel groups raise (assert) here, so `except` is the normal
-        # "dimension not enabled" path; the receive path uses identical fallbacks,
-        # so prefetch and receive always agree on the role (no consume-once split).
         try:
             world = get_world_group()
             world_size = world.world_size
@@ -1294,10 +1280,6 @@ class OmniKVTransferManager:
             return None, 0
         return self.get_prefetched_kv(rid)
 
-    def abort_load_kv(self, request_id: str) -> None:
-        """Cancel a pending prefetch (best-effort; a started get() runs to completion)."""
-        self._discard_future(request_id)
-
     def _discard_future(self, request_id: str) -> None:
         """Stop tracking a prefetch: cancel if not started, otherwise attach a
         callback that drops the result so its pinned payload can be freed.
@@ -1774,8 +1756,14 @@ class OmniKVTransferManager:
         if combined is None or combined.numel() == 0:
             return None
 
-        side_len = int(combined[:4].cpu().view(torch.int32).item())
         offset = 4
+        side_len = int(combined[:offset].cpu().view(torch.int32).item())
+        if side_len <= 0 and combined.numel() > offset:
+            raise RuntimeError(
+                f"D2D: corrupt KV payload (side_len={side_len}, "
+                f"total_bytes={combined.numel()}, likely sender-side failure). "
+                "KV cache data is unusable."
+            )
         side_bytes = combined[offset : offset + side_len].cpu().numpy().tobytes()
         offset += side_len
         side: dict[str, Any] = OmniSerializer.deserialize(side_bytes)
@@ -1832,11 +1820,18 @@ class OmniKVTransferManager:
         combined = self._kv_payload_to_d2d(kv_payload, device)
         if combined is None:
             group.send_object(kv_payload, dst)
-        else:
-            group.send_object(int(combined.numel()), dst)
+            return
+        size = int(combined.numel())
+        group.send_object(size, dst)
+        try:
             group.send(combined, dst)
+        except Exception:
+            logger.exception("D2D: send(combined) to rank %d failed; sending zero sentinel", dst)
+            combined.zero_()
+            group.send(combined, dst)
+            raise
 
-    def _recv_kv_payload_d2d(self, group: Any, src: int, device: torch.device) -> dict[str, Any] | None:
+    def _recv_kv_payload_d2d(self, group: Any, src: int) -> dict[str, Any] | None:
         """Inverse of :meth:`_send_kv_payload_d2d`."""
         size_or_obj = group.recv_object(src)
         if not isinstance(size_or_obj, int):
@@ -1954,9 +1949,15 @@ class OmniKVTransferManager:
                         kv_payload = cfg_rank_payloads[0]
                         for dst_cfg_rank in range(1, cfg_size):
                             if use_d2d:
-                                self._send_kv_payload_d2d(
-                                    cfg_group, cfg_rank_payloads[dst_cfg_rank], dst_cfg_rank, target_device
-                                )
+                                try:
+                                    self._send_kv_payload_d2d(
+                                        cfg_group,
+                                        cfg_rank_payloads[dst_cfg_rank],
+                                        dst_cfg_rank,
+                                        target_device,
+                                    )
+                                except Exception:
+                                    continue
                             else:
                                 cfg_group.send_object(
                                     cfg_rank_payloads[dst_cfg_rank],
@@ -1969,12 +1970,20 @@ class OmniKVTransferManager:
                     if cfg_size > 1:
                         for dst_cfg_rank in range(1, cfg_size):
                             if use_d2d:
-                                self._send_kv_payload_d2d(cfg_group, None, dst_cfg_rank, target_device)
+                                try:
+                                    self._send_kv_payload_d2d(
+                                        cfg_group,
+                                        None,
+                                        dst_cfg_rank,
+                                        target_device,
+                                    )
+                                except Exception:
+                                    continue
                             else:
                                 cfg_group.send_object(None, dst_cfg_rank)
             elif sp_rank == 0 and cfg_size > 1:
                 if self._use_d2d(target_device):
-                    kv_payload = self._recv_kv_payload_d2d(cfg_group, 0, target_device)
+                    kv_payload = self._recv_kv_payload_d2d(cfg_group, 0)
                 else:
                     kv_payload = cfg_group.recv_object(0)
             # sp broadcast

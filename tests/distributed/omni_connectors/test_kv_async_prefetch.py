@@ -153,14 +153,6 @@ def test_get_prefetched_kv_sweeps_stale_entries():
     assert receiver._load_futures == {}
 
 
-def test_abort_load_kv_drops_future():
-    sender, receiver, _ = _make_sender_receiver()
-    _seed_payload(sender, "rid-ab")
-    receiver.start_load_kv({"request_id": "rid-ab", "kv_sender_info": _SENDER_INFO})
-    receiver.abort_load_kv("rid-ab")
-    assert "rid-ab" not in receiver._load_futures
-
-
 # --------------------------------------------------------------------------- #
 #  get_prefetched_kv: miss returns None, stale sweep
 # --------------------------------------------------------------------------- #
