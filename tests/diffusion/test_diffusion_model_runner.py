@@ -61,7 +61,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
-        receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
+        receive_multi_kv_cache_distributed=lambda *a, **k: None,
     )
     return runner
 

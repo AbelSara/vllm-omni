@@ -575,6 +575,21 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
+        omni_config_group.add_argument(
+            "--enable-kv-async-prefetch",
+            action="store_true",
+            help="Prefetch the next request's AR KV on a background thread during the current "
+            "forward (diffusion receive stage; covers TP / SP / CFG-Parallel / HSDP). This single "
+            "switch also enables the dedicated-stream async H2D copy. Off by default.",
+        )
+        omni_config_group.add_argument(
+            "--kv-prefetch-min-free-mem-ratio",
+            type=float,
+            default=0.0,
+            help="Skip KV prefetch when the target GPU's free-memory fraction is below this value "
+            "(0.0-1.0; 0 = no check). Under memory pressure the synchronous receive is used instead. "
+            "Only relevant with --enable-kv-async-prefetch.",
+        )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

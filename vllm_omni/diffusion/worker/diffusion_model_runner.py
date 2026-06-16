@@ -39,7 +39,10 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
-from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    KVPrefetchConsumeError,
+    OmniKVTransferManager,
+)
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -80,8 +83,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Initialize KV cache manager for connector management.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+
+        # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
+        # companion KV collector is set (that KV is not backgrounded).
+        has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
+
+        self._kv_prefetch_enabled = (
+            bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
+            and not has_cfg_companion_kv
+            and self.kv_transfer_manager.config.need_recv_cache
+        )
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -250,7 +263,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -274,12 +287,42 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
+            target_device = getattr(self.pipeline, "device", None)
+            # Consume the payload prefetched during the previous forward; miss
+            # falls back to a sync receive inside the distributed entry below.
+            prefetched = None
+            prefetch_failed = False
+            kv_recv_t0 = time.perf_counter()
+            if self._kv_prefetch_enabled:
+                try:
+                    prefetched, _ = self.kv_transfer_manager.consume_loaded_kv(req, target_device)
+                except KVPrefetchConsumeError:
+                    # Payload consumed then failed; sync retry impossible.  Don't
+                    # raise — flag it so the distributed receive drives its failure
+                    # path and the owner never deadlocks its followers.
+                    logger.exception(
+                        "KV prefetch consumed payload for %s but failed; signaling receive failure",
+                        req.request_id,
+                    )
+                    prefetch_failed = True
             self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                 req,
                 cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
+                target_device=target_device,
+                prefetched=prefetched,
+                prefetch_failed=prefetch_failed,
             )
+            kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+            logger.debug(
+                "KV recv for %s (%s) %.1fms",
+                req.request_id,
+                "prefetch HIT" if prefetched is not None else "sync/miss",
+                kv_recv_ms,
+            )
+
+            # Kick off the next request's prefetch (+ H2D) to overlap this forward.
+            if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
+                self.kv_transfer_manager.start_load_kv(kv_prefetch_jobs, target_device)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
