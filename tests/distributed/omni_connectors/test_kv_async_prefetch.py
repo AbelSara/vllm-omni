@@ -1,6 +1,6 @@
 """Background KV prefetch — CPU-testable mechanism.
 
-Covers opt-in gating, the start_load_kv / get_prefetched_kv round trip over a
+Covers opt-in gating, the start_prefetch / consume_prefetched_kv round trip over a
 mock connector, dedup, per-call sender_info isolation, role classification, and
 miss/abort paths.  GPU H2D and D2D paths need CUDA (integration tests).
 """
@@ -20,7 +20,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-# start_load_kv() skips stubs without a sender endpoint, so submissions carry it.
+# start_prefetch() skips stubs without a sender endpoint, so submissions carry it.
 _SENDER_INFO = {"host": "127.0.0.1", "zmq_port": 50051}
 
 
@@ -73,6 +73,11 @@ def _seed_payload(sender, req_id, *, num_layers=2, block_size=4, num_heads=4, he
     )
 
 
+def _req(rid):
+    """A minimal request carrying just ``request_id`` (consume_prefetched_kv only needs that)."""
+    return SimpleNamespace(request_id=rid)
+
+
 # --------------------------------------------------------------------------- #
 #  Opt-in gating
 # --------------------------------------------------------------------------- #
@@ -90,10 +95,10 @@ def test_from_od_config_enables_prefetch_flag():
     assert OmniKVTransferManager.from_od_config(od2)._async_prefetch is False
 
 
-def test_start_load_kv_noop_when_disabled():
+def test_start_prefetch_noop_when_disabled():
     _, receiver, _ = _make_sender_receiver(async_prefetch=False)
-    receiver.start_load_kv({"request_id": "r1", "kv_sender_info": None})
-    assert receiver._load_futures == {}
+    receiver.start_prefetch({"request_id": "r1", "kv_sender_info": None})
+    assert receiver._prefetch_futures == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -105,79 +110,77 @@ def test_prefetch_round_trip_returns_data():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-1")
 
-    receiver.start_load_kv({"request_id": "rid-1", "kv_sender_info": _SENDER_INFO})
-    assert "rid-1" in receiver._load_futures
+    receiver.start_prefetch({"request_id": "rid-1", "kv_sender_info": _SENDER_INFO})
+    assert "rid-1" in receiver._prefetch_futures
 
-    data, size = receiver.get_prefetched_kv("rid-1")
+    data, size = receiver.consume_prefetched_kv(_req("rid-1"))
     assert data is not None
     assert "layer_blocks" in data
     assert data["metadata"]["seq_len"] == 10
     assert size > 0
     # Future is consumed (popped) on retrieval.
-    assert "rid-1" not in receiver._load_futures
+    assert "rid-1" not in receiver._prefetch_futures
 
 
-def test_get_prefetched_kv_miss_without_prefetch_returns_none():
-    # Disabled prefetch => (None, 0) for any request.
+def test_consume_prefetched_kv_miss_without_prefetch_returns_none():
     _, receiver, _ = _make_sender_receiver(async_prefetch=False)
-    assert receiver.get_prefetched_kv("never-prefetched") == (None, 0)
+    assert receiver.consume_prefetched_kv(_req("never-prefetched")) == (None, 0)
 
 
-def test_start_load_kv_dedups_same_request():
+def test_start_prefetch_dedups_same_request():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-dup")
-    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
-    fut1 = receiver._load_futures["rid-dup"]
-    receiver.start_load_kv({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
-    assert receiver._load_futures["rid-dup"] is fut1
+    receiver.start_prefetch({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
+    fut1 = receiver._prefetch_futures["rid-dup"]
+    receiver.start_prefetch({"request_id": "rid-dup", "kv_sender_info": _SENDER_INFO})
+    assert receiver._prefetch_futures["rid-dup"] is fut1
 
 
-def test_start_load_kv_skips_without_sender_info():
+def test_start_prefetch_skips_without_sender_info():
     # No endpoint => no submission; the sync path handles it.
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-nosi")
-    receiver.start_load_kv({"request_id": "rid-nosi", "kv_sender_info": None})
-    assert receiver._load_futures == {}
+    receiver.start_prefetch({"request_id": "rid-nosi", "kv_sender_info": None})
+    assert receiver._prefetch_futures == {}
 
 
-def test_get_prefetched_kv_sweeps_stale_entries():
-    # Consuming a request's slot drops every other tracked prefetch (a leftover
-    # aborted request may never see another start_load_kv to reclaim it).
+def test_consume_prefetched_kv_sweeps_stale_entries():
+    # Consuming a slot drops every other tracked prefetch.
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-stale")
-    receiver.start_load_kv({"request_id": "rid-stale", "kv_sender_info": _SENDER_INFO})
-    assert "rid-stale" in receiver._load_futures
+    receiver.start_prefetch({"request_id": "rid-stale", "kv_sender_info": _SENDER_INFO})
+    assert "rid-stale" in receiver._prefetch_futures
     # Miss on the current request still sweeps stale entries.
     receiver._async_prefetch = False
-    assert receiver.get_prefetched_kv("rid-current") == (None, 0)
-    assert receiver._load_futures == {}
+    assert receiver.consume_prefetched_kv(_req("rid-current")) == (None, 0)
+    assert receiver._prefetch_futures == {}
 
 
 # --------------------------------------------------------------------------- #
-#  get_prefetched_kv: miss returns None, stale sweep
+#  consume_prefetched_kv: miss returns None, stale sweep
 # --------------------------------------------------------------------------- #
 
 
-def test_start_load_kv_sweeps_orphan():
+def test_start_prefetch_sweeps_orphan():
     # An orphan prefetch (e.g. aborted) is dropped when the next prefetch starts.
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-orphan")
     _seed_payload(sender, "rid-next")
-    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})
-    receiver.get_prefetched_kv("rid-orphan")  # complete the future
-    receiver.start_load_kv({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})  # re-add as leftover
-    receiver.start_load_kv({"request_id": "rid-next", "kv_sender_info": _SENDER_INFO})
-    assert "rid-orphan" not in receiver._load_futures
-    assert "rid-next" in receiver._load_futures
+    receiver.start_prefetch({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})
+    receiver.consume_prefetched_kv(_req("rid-orphan"))  # complete the future
+    receiver.start_prefetch({"request_id": "rid-orphan", "kv_sender_info": _SENDER_INFO})  # re-add as leftover
+    receiver.start_prefetch({"request_id": "rid-next", "kv_sender_info": _SENDER_INFO})
+    assert "rid-orphan" not in receiver._prefetch_futures
+    assert "rid-next" in receiver._prefetch_futures
 
 
 def test_shutdown_prefetch_clears_state():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-sd")
-    receiver.start_load_kv({"request_id": "rid-sd", "kv_sender_info": _SENDER_INFO})
+    receiver.start_prefetch({"request_id": "rid-sd", "kv_sender_info": _SENDER_INFO})
     receiver.shutdown_prefetch()
-    assert receiver._load_futures == {}
-    assert receiver._load_executor is None
+    assert receiver._prefetch_futures == {}
+    assert receiver._prefetch_executor is None
 
 
 # --------------------------------------------------------------------------- #
@@ -195,7 +198,6 @@ def test_receive_with_sender_info_does_not_mutate_instance_state():
         "rid-si",
         target_device=None,
         sender_info={"host": "1.2.3.4", "zmq_port": 50051},
-        pin=False,
     )
     # The per-call endpoint must not leak into instance fields.
     assert receiver._sender_base_host is None
@@ -203,7 +205,7 @@ def test_receive_with_sender_info_does_not_mutate_instance_state():
 
 
 # --------------------------------------------------------------------------- #
-#  Receive-role classification (_recv_role) and the follower prefetch guard
+#  Receive-role classification (recv_role) and the follower prefetch guard
 # --------------------------------------------------------------------------- #
 
 import vllm_omni.diffusion.distributed.parallel_state as ps  # noqa: E402
@@ -213,103 +215,112 @@ def _patch_topo(monkeypatch, *, world_size, world_rank=0, cfg_size=1, cfg_rank=0
     monkeypatch.setattr(ps, "get_world_group", lambda: SimpleNamespace(world_size=world_size, rank_in_group=world_rank))
     monkeypatch.setattr(ps, "get_classifier_free_guidance_world_size", lambda: cfg_size)
     monkeypatch.setattr(ps, "get_classifier_free_guidance_rank", lambda: cfg_rank)
+    monkeypatch.setattr(ps, "get_cfg_group", lambda: None)
     monkeypatch.setattr(ps, "get_sequence_parallel_world_size", lambda: sp_size)
     monkeypatch.setattr(ps, "get_sequence_parallel_rank", lambda: sp_rank)
+    monkeypatch.setattr(ps, "get_sp_group", lambda: None)
 
 
 def _set_tp(mgr, src, tgt):
     mgr._tp_topo = SimpleNamespace(source_tp_size=src, target_tp_size=tgt, local_rank=0)
 
 
-def test_recv_role_world1_is_rank_local(monkeypatch):
+def _role(mgr):
+    """Recompute the receive role from the (patched) parallel state, bypassing the cache."""
+    mgr._topo_config = None
+    return mgr.topo_config.role
+
+
+def test_recv_role_world1_is_local(monkeypatch):
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 1, 1)
     _patch_topo(monkeypatch, world_size=1)
-    assert mgr._recv_role() is ReceiveRole.RANK_LOCAL
+    assert _role(mgr) is ReceiveRole.LOCAL
 
 
-def test_recv_role_pure_tp_is_rank_local(monkeypatch):
+def test_recv_role_pure_tp_is_local(monkeypatch):
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 2, 2)
     _patch_topo(monkeypatch, world_size=2)
-    assert mgr._recv_role() is ReceiveRole.RANK_LOCAL
+    assert _role(mgr) is ReceiveRole.LOCAL
 
 
-def test_recv_role_cfg_owner_and_follower(monkeypatch):
+def test_recv_role_cfg_leader_and_follower(monkeypatch):
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=0)
-    assert mgr._recv_role() is ReceiveRole.OWNER
+    assert _role(mgr) is ReceiveRole.LEADER
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=1)
-    assert mgr._recv_role() is ReceiveRole.FOLLOWER
+    assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
-def test_recv_role_sp_owner_and_follower(monkeypatch):
+def test_recv_role_sp_leader_and_follower(monkeypatch):
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 2, 2)
     _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=0)
-    assert mgr._recv_role() is ReceiveRole.OWNER
+    assert _role(mgr) is ReceiveRole.LEADER
     _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=1)
-    assert mgr._recv_role() is ReceiveRole.FOLLOWER
+    assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
-def test_recv_role_tp_and_sp_owner_per_tp_rank(monkeypatch):
-    # TP=2 + SP=2: sp_rank 0 is owner (pulls), sp_rank 1 is follower (gets broadcast).
+def test_recv_role_tp_and_sp_leader_per_tp_rank(monkeypatch):
+    # TP=2 + SP=2: sp_rank 0 is leader (pulls), sp_rank 1 is follower (gets broadcast).
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 2, 2)
     _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=0)
-    assert mgr._recv_role() is ReceiveRole.OWNER
+    assert _role(mgr) is ReceiveRole.LEADER
     _patch_topo(monkeypatch, world_size=4, sp_size=2, sp_rank=1)
-    assert mgr._recv_role() is ReceiveRole.FOLLOWER
+    assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
 def test_recv_role_hsdp_world_broadcast(monkeypatch):
-    # TP inactive, world > 1 (HSDP): rank-0 owner, others follower.
+    # TP inactive, world > 1 (HSDP): rank-0 leader, others follower.
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
     _set_tp(mgr, 1, 1)
     _patch_topo(monkeypatch, world_size=2, world_rank=0)
-    assert mgr._recv_role() is ReceiveRole.OWNER
+    assert _role(mgr) is ReceiveRole.LEADER
     _patch_topo(monkeypatch, world_size=2, world_rank=1)
-    assert mgr._recv_role() is ReceiveRole.FOLLOWER
+    assert _role(mgr) is ReceiveRole.FOLLOWER
 
 
-def test_recv_role_uninitialized_defaults_rank_local(monkeypatch):
+def test_recv_role_uninitialized_defaults_local(monkeypatch):
     mgr = OmniKVTransferManager(OmniKVCacheConfig())
 
     def _boom():
         raise AssertionError("world group is not initialized")
 
     monkeypatch.setattr(ps, "get_world_group", _boom)
-    assert mgr._recv_role() is ReceiveRole.RANK_LOCAL
+    assert _role(mgr) is ReceiveRole.LOCAL
 
 
-def test_start_load_kv_skips_follower(monkeypatch):
-    # A follower never pulls, so start_load_kv must not submit.
+def test_start_prefetch_skips_follower(monkeypatch):
+    # A follower never pulls, so start_prefetch must not submit.
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-fol")
     _set_tp(receiver, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=1)
-    receiver.start_load_kv({"request_id": "rid-fol", "kv_sender_info": _SENDER_INFO})
-    assert receiver._load_futures == {}
+    receiver.start_prefetch({"request_id": "rid-fol", "kv_sender_info": _SENDER_INFO})
+    assert receiver._prefetch_futures == {}
 
 
-def test_start_load_kv_submits_for_owner(monkeypatch):
+def test_start_prefetch_submits_for_owner(monkeypatch):
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-own")
     _set_tp(receiver, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=0)
-    receiver.start_load_kv({"request_id": "rid-own", "kv_sender_info": _SENDER_INFO})
-    assert "rid-own" in receiver._load_futures
+    receiver.start_prefetch({"request_id": "rid-own", "kv_sender_info": _SENDER_INFO})
+    assert "rid-own" in receiver._prefetch_futures
 
 
-def test_apply_prefetched_kv_cpu_target_applies_without_h2d():
+def test_consume_then_apply_attaches_payload():
     sender, receiver, _ = _make_sender_receiver()
     _seed_payload(sender, "rid-apply")
-    receiver.start_load_kv({"request_id": "rid-apply", "kv_sender_info": _SENDER_INFO})
-    data, _ = receiver.get_prefetched_kv("rid-apply")
+    receiver.start_prefetch({"request_id": "rid-apply", "kv_sender_info": _SENDER_INFO})
+    data, _ = receiver.consume_prefetched_kv(_req("rid-apply"))
     assert data is not None
 
     req = OmniDiffusionRequest(prompts=["p"], sampling_params=OmniDiffusionSamplingParams(), request_id="rid-apply")
-    # CPU target → no async H2D; just attaches the payload.
-    receiver.apply_prefetched_kv(req, data, target_device=torch.device("cpu"))
+    # Mirror consume_and_distribute_kv_cache's LOCAL apply path (CPU: record_stream no-op).
+    receiver._record_stream_for_prefetched(data)
+    receiver.apply_kv_cache_to_request(req, data)
     assert req.past_key_values is not None

@@ -12,7 +12,7 @@ Two submission modes:
       While the DiT denoises request N (~25 s), the AR stage has already
       finished request N+1 and enqueued it to the DiT waiting queue.  The
       scheduler sees the next request and populates prefetch_stub, so
-      start_load_kv() fires — subsequent requests should show HIT.
+      start_prefetch() fires — subsequent requests should show HIT.
 
 Usage:
     python -m examples.offline_inference.hunyuan_image3.kv_prefetch_bench \
@@ -197,7 +197,7 @@ def _main() -> None:
         # them all, and while DiT denoises request N, the AR stage has already
         # finished request N+1 and queued it in the DiT scheduler's waiting
         # list.  The scheduler then builds a prefetch_stub for N+1 so
-        # start_load_kv() fires during request N's step 0.
+        # start_prefetch() fires during request N's step 0.
         print(f"Running {total} requests in pipeline mode ({args.warmup} warmup + {args.num_requests} measured)...\n")
         print(f"  Submitting all {total} requests to the orchestrator at once...")
         t_wall_start = time.perf_counter()
