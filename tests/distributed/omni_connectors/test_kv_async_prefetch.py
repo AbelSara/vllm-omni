@@ -93,6 +93,36 @@ def test_from_od_config_enables_prefetch_flag():
     assert OmniKVTransferManager.from_od_config(od)._async_prefetch is True
     od2 = SimpleNamespace(omni_kv_config=None)
     assert OmniKVTransferManager.from_od_config(od2)._async_prefetch is False
+    od3 = SimpleNamespace(omni_kv_config={"enable_kv_async_prefetch": False})
+    assert OmniKVTransferManager.from_od_config(od3)._async_prefetch is False
+
+
+def test_prefetch_preserved_with_connector_config():
+    # The flag must survive merging with a populated connector config.
+    od = SimpleNamespace(
+        omni_kv_config={
+            "connector_config": {"type": "mock"},
+            "need_recv_cache": True,
+            "enable_kv_async_prefetch": True,
+        },
+    )
+    assert OmniKVTransferManager.from_od_config(od)._async_prefetch is True
+
+
+def test_prefetch_disabled_with_cfg_companion_collector():
+    # A CFG companion collector forces the synchronous path (see _resolve_async_prefetch).
+    od = SimpleNamespace(
+        omni_kv_config={"enable_kv_async_prefetch": True},
+        cfg_kv_collect_func=lambda *a, **k: {},
+    )
+    assert OmniKVTransferManager.from_od_config(od)._async_prefetch is False
+
+
+def test_from_vllm_config_ar_path_is_always_sync():
+    # The AR entry point never enables prefetch.
+    model_config = SimpleNamespace(omni_kv_config=None)
+    vllm_config = SimpleNamespace(kv_transfer_config=None)
+    assert OmniKVTransferManager.from_vllm_config(vllm_config, model_config)._async_prefetch is False
 
 
 def test_start_prefetch_noop_when_disabled():

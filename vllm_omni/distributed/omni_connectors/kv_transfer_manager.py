@@ -580,7 +580,6 @@ class OmniKVTransferManager:
             world_size = world.world_size
             world_rank = world.rank_in_group
         except Exception:
-            # Topology uninitialized → default to LOCAL (self-receive, no collective).
             logger.exception("World group unavailable; defaulting to LOCAL")
             return _TransferTopoConfig(
                 role=ReceiveRole.LOCAL,
