@@ -158,12 +158,6 @@ class OmniPlatform(Platform):
 
     @classmethod
     def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
-        """Return ``(free_bytes, total_bytes)`` for *device*.
-
-        Platforms that don't expose a memory query return a large default so
-        that callers gating on a free-fraction threshold treat the device as
-        unconstrained (throttle skipped) rather than raising.
-        """
         return 1 << 62, 1 << 62
 
     @classmethod

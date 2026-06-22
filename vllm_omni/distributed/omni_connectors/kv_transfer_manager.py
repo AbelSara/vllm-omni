@@ -1230,7 +1230,7 @@ class OmniKVTransferManager:
         sender_info: dict[str, Any] | None,
         target_device: torch.device | None,
     ) -> tuple[dict[str, Any] | None, int]:
-        """Bg-thread body: get + deserialize + async H2D on ``_bg_copy_stream``.
+        """Bg-thread body: get + deserialize + H2D on the dedicated ``_bg_copy_stream``.
 
         Raises on failure (payload may be consumed → no sync retry).
         """
@@ -1243,7 +1243,7 @@ class OmniKVTransferManager:
                     self._bg_copy_stream = current_omni_platform.Stream()
                 with current_omni_platform.stream(self._bg_copy_stream):
                     data, size = self.receive_kv_cache_for_request(
-                        request_id, target_device=target_device, sender_info=sender_info, async_h2d=True
+                        request_id, target_device=target_device, sender_info=sender_info
                     )
             else:
                 data, size = self.receive_kv_cache_for_request(
@@ -1326,12 +1326,10 @@ class OmniKVTransferManager:
         target_device: torch.device | None = None,
         *,
         sender_info: dict[str, Any] | None = None,
-        async_h2d: bool = False,
     ) -> tuple[dict[str, Any] | None, int]:
         """Receive KV cache for *request_id*; returns (data dict, size) or (None, 0).
 
-        ``sender_info`` overrides instance ``_sender_base_*`` (per-call endpoint);
-        ``async_h2d`` uses a non-blocking stream-synced H2D (prefetch bg thread only).
+        ``sender_info`` overrides instance ``_sender_base_*`` (per-call endpoint).
         """
         if not self.config.need_recv_cache:
             logger.debug("Skip receiving KV cache for %s (need_recv_cache=False)", request_id)
@@ -1448,7 +1446,6 @@ class OmniKVTransferManager:
                     data = slice_received_rank_shard(data, topo, slicer=self.kv_payload_slicer)
 
                     needs_clone = bool(deferred_memory)
-                    staging: list[torch.Tensor] = []  # keep pinned sources alive until sync (avoid UAF)
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
@@ -1461,17 +1458,9 @@ class OmniKVTransferManager:
                                     if not isinstance(tensor, torch.Tensor):
                                         continue
                                     if target_device is not None and tensor.device != target_device:
-                                        if async_h2d:
-                                            src = tensor if tensor.is_pinned() else tensor.pin_memory()
-                                            if src is not tensor:
-                                                staging.append(src)
-                                            cache_list[i] = src.to(target_device, non_blocking=True)
-                                        else:
-                                            cache_list[i] = tensor.to(target_device).contiguous()
+                                        cache_list[i] = tensor.to(target_device).contiguous()
                                     elif needs_clone:
                                         cache_list[i] = tensor.clone()
-                            if async_h2d:
-                                current_omni_platform.current_stream().synchronize()
                     except Exception as exc:
                         logger.exception("Failed to detach/move KV cache tensors for %s", request_id)
                         raise KVPrefetchConsumeError(
