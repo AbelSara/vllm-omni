@@ -608,21 +608,23 @@ class OmniKVTransferManager:
 
         tp_active = self._tp_topo.source_tp_size > 1 or self._tp_topo.target_tp_size > 1
 
+        # CFG/SP groups may legitimately be uninitialized on pure-TP or
+        # world-only distributed paths; treat that as "not active" (size 1)
+        # rather than raising, so those paths can still take the local/world
+        # receive route.
         try:
             cfg_size = get_classifier_free_guidance_world_size()
             cfg_rank = get_classifier_free_guidance_rank()
             cfg_group = get_cfg_group()
         except Exception:
-            logger.exception("CFG parallel state unavailable during topology detection")
-            raise
+            cfg_size, cfg_rank, cfg_group = 1, 0, None  # CFG-parallel not enabled
 
         try:
             sp_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
             sp_group = get_sp_group()
         except Exception:
-            logger.exception("SP parallel state unavailable during topology detection")
-            raise
+            sp_size, sp_rank, sp_group = 1, 0, None  # SP not enabled
 
         if tp_active and cfg_size <= 1 and sp_size <= 1:
             role = ReceiveRole.LOCAL
@@ -1790,6 +1792,7 @@ class OmniKVTransferManager:
         if pt.is_local:
             return None
 
+        device = target_device if target_device is not None else torch.device("cpu")
         # TP + CFG/SP
         if pt.tp_active and (pt.cfg_active or pt.sp_active):
             kv_payload: dict[str, object] | None = None
@@ -1799,16 +1802,16 @@ class OmniKVTransferManager:
                         self._build_cfg_rank_local_payloads(req, pt.cfg_size) if received else [None] * pt.cfg_size
                     )
                     kv_payload = payloads[0]
-                    self._cfg_scatter(pt.cfg_group, payloads, pt.cfg_size, target_device, self._resolve_request_id(req))
+                    self._cfg_scatter(pt.cfg_group, payloads, pt.cfg_size, device, self._resolve_request_id(req))
                 elif pt.sp_active:
                     kv_payload = self._collect_request_kv_payload(req) if received else None
                 if pt.sp_active and pt.sp_group is not None:
-                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, target_device, src=0)
+                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
             elif pt.is_follower:
                 if pt.cfg_active and pt.sp_rank == 0:
-                    kv_payload = self._recv_kv_payload(pt.cfg_group, 0, target_device)
+                    kv_payload = self._recv_kv_payload(pt.cfg_group, 0, device)
                 if pt.sp_active and pt.sp_group is not None:
-                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, target_device, src=0)
+                    kv_payload = self._broadcast_kv_payload(pt.sp_group, kv_payload, device, src=0)
             else:
                 logger.error("distribute_kv_cache: unexpected role %s in TP+CFG/SP path", pt.role)
                 return None
@@ -1818,7 +1821,7 @@ class OmniKVTransferManager:
         kv_payload = None
         if pt.is_leader and received:
             kv_payload = self._collect_request_kv_payload(req)
-        kv_payload = self._broadcast_kv_payload(pt.world, kv_payload, target_device, src=0)
+        kv_payload = self._broadcast_kv_payload(pt.world, kv_payload, device, src=0)
         return kv_payload or None
 
 
