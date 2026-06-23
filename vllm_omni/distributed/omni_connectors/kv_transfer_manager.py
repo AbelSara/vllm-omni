@@ -397,6 +397,8 @@ class OmniKVTransferManager:
         # Prefetch
         self._async_prefetch = async_prefetch
         self._prefetch_min_free_mem_ratio: float = max(0.0, config.kv_prefetch_min_free_mem_ratio)
+        # Single-worker: serial mode ensures at most one outstanding prefetch
+        # and avoids stream-creation races on _bg_copy_stream.
         self._prefetch_executor: ThreadPoolExecutor | None = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch") if async_prefetch else None
         )
@@ -1242,6 +1244,7 @@ class OmniKVTransferManager:
                 # bg thread doesn't inherit the main thread's current device.
                 torch.accelerator.set_device_index(target_device.index)
                 if self._bg_copy_stream is None:
+                    assert self._prefetch_executor._max_workers == 1
                     self._bg_copy_stream = current_omni_platform.Stream()
                 with current_omni_platform.stream(self._bg_copy_stream):
                     data, size = self.receive_kv_cache_for_request(
@@ -1685,7 +1688,12 @@ class OmniKVTransferManager:
     def _broadcast_kv_payload(
         self, group: Any, kv_payload: dict[str, Any] | None, device: torch.device, src: int = 0
     ) -> dict[str, Any] | None:
-        """Broadcast KV payload via packed tensor; falls back to ``broadcast_object`` on packing failure."""
+        """Broadcast KV payload via packed tensor; falls back to ``broadcast_object`` on packing failure.
+
+        The packed-tensor path uses a two-phase collective (size then data).
+        Both phases must always be called together — a rank entering only
+        one phase will deadlock the group.
+        """
         is_src = group.rank_in_group == src
         if is_src:
             combined = self._pack_kv_payload(kv_payload, device)
@@ -1746,6 +1754,7 @@ class OmniKVTransferManager:
     def consume_and_distribute_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
         """Consume prefetched KV → apply → distribute; sync-receive on miss (no retry on consume-error)."""
         received = False
+        payload_consumed = False
         if self._async_prefetch and not self.topo_config.is_follower:
             try:
                 data, _ = self.consume_prefetched_kv(req)
@@ -1754,11 +1763,16 @@ class OmniKVTransferManager:
                     self.apply_kv_cache_to_request(req, data)
                     received = True
             except KVPrefetchConsumeError:
-                logger.exception(
-                    "KV prefetch consumed payload for %s but failed; signaling receive miss",
+                logger.error(
+                    "KV prefetch consumed payload for %s but post-get failed; "
+                    "request cannot recover",
                     self._resolve_request_id(req),
                 )
-        if not received and not self.topo_config.is_follower:
+                payload_consumed = True
+        # Only fall back to sync receive on miss, not when payload was
+        # already consumed from the connector (sync receive would block
+        # until timeout as the data is gone).
+        if not received and not self.topo_config.is_follower and not payload_consumed:
             logger.debug("KV prefetch miss for %s; falling back to sync receive", self._resolve_request_id(req))
             received = self.receive_multi_kv_cache(req, None, target_device)
         kv_payload = self.distribute_kv_cache(req, target_device, received=received)

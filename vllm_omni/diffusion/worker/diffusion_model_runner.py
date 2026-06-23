@@ -298,15 +298,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # consume prior-forward payload, sync-fallback on miss; else sync receive.
             kv_recv_t0 = time.perf_counter()
             if self._kv_prefetch_enabled:
-                self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=target_device)
+                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=target_device)
             else:
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                kv_received = self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                     target_device=target_device,
                 )
             kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
             logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
+
+            if not kv_received and getattr(req, "need_kv_receive", True):
+                raise RuntimeError(
+                    f"KV cache receive failed for request {req.request_id}; "
+                    f"cannot proceed with diffusion forward without AR KV cache"
+                )
 
             # Kick off the next request's prefetch (+ H2D) to overlap this forward.
             if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
