@@ -1764,8 +1764,7 @@ class OmniKVTransferManager:
                     received = True
             except KVPrefetchConsumeError:
                 logger.error(
-                    "KV prefetch consumed payload for %s but post-get failed; "
-                    "request cannot recover",
+                    "KV prefetch consumed payload for %s but post-get failed; request cannot recover",
                     self._resolve_request_id(req),
                 )
                 payload_consumed = True
