@@ -301,7 +301,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # consume prior-forward payload, sync-fallback on miss; else sync receive.
             kv_recv_t0 = time.perf_counter()
             if self._kv_prefetch_enabled:
-                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=self.target_device)
+                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                    req, target_device=self.target_device,
+                )
             else:
                 kv_received = self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     req,
