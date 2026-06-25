@@ -93,6 +93,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             and self.kv_transfer_manager.config.need_recv_cache
         )
 
+    @property
+    def target_device(self) -> torch.device | None:
+        return getattr(self.pipeline, "device", None)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -293,17 +297,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            target_device = getattr(self.pipeline, "device", None)
             # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
             # consume prior-forward payload, sync-fallback on miss; else sync receive.
             kv_recv_t0 = time.perf_counter()
             if self._kv_prefetch_enabled:
-                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=target_device)
+                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(req, target_device=self.target_device)
             else:
                 kv_received = self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=target_device,
+                    target_device=self.target_device,
                 )
             kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
             logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
@@ -316,7 +319,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             # Kick off the next request's prefetch (+ H2D) to overlap this forward.
             if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
-                self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, target_device)
+                self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
@@ -423,7 +426,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     state_req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=getattr(self.pipeline, "device", None),
+                    target_device=self.target_device,
                 )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
