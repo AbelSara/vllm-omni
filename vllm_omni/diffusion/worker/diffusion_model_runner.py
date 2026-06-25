@@ -324,7 +324,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
             logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
-            if not kv_received and getattr(req, "need_kv_receive", True):
+            if not kv_received and self.kv_transfer_manager.config.need_recv_cache:
                 raise RuntimeError(
                     f"KV cache receive failed for request {req.request_id}; "
                     f"cannot proceed with diffusion forward without AR KV cache"

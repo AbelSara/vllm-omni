@@ -697,8 +697,6 @@ class DiffusionEngine:
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
-        # Dummy warmup has no upstream AR stage providing KV cache.
-        req.need_kv_receive = False
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
         output = self.add_req_and_wait_for_response(request)
