@@ -856,8 +856,13 @@ class OmniKVTransferManager:
 
             payloads.append(local_payload)
 
+        padding = None
+        if not branch_roles and cfg_size == 2 and main_payload:
+            # AR didn't split KV by branch; cfg follower needs the same
+            # positive KV for shared-prefix reuse.
+            padding = dict(main_payload)
         while len(payloads) < cfg_size:
-            payloads.append(None)
+            payloads.append(padding)
 
         return payloads[:cfg_size]
 
