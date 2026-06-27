@@ -93,6 +93,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             and self.kv_transfer_manager.config.need_recv_cache
         )
 
+    def init_prefetch_queue(self) -> None:
+        """Initialise the background PrefetchQueue (call after load_model)."""
+        if self._kv_prefetch_enabled:
+            self.kv_transfer_manager.init_prefetch_queue(target_device=self.target_device)
+
+    def enqueue_prefetch(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
+        """Forward a fire-and-forget prefetch notification to the PrefetchQueue."""
+        self.kv_transfer_manager.enqueue_prefetch(request_id, kv_sender_info)
+
     @property
     def target_device(self) -> torch.device | None:
         return getattr(self.pipeline, "device", None)
@@ -240,6 +249,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
         logger.info("Model runner: Initialization complete.")
+        self.init_prefetch_queue()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
@@ -429,11 +439,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
                 state_req = copy.copy(req)
                 state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
+                if self._kv_prefetch_enabled:
+                    self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                        state_req,
+                        target_device=self.target_device,
+                    )
+                else:
+                    self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                        state_req,
+                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        target_device=self.target_device,
+                    )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 

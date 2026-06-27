@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified OmniConnector and KV cache transfer management."""
 
+from __future__ import annotations
+
 import enum
 import json
 import struct
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -308,7 +312,7 @@ class KVCacheTransferData:
         }
 
     @staticmethod
-    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
+    def from_bytes(raw: bytes | bytearray | memoryview) -> dict[str, Any]:
         """Reconstruct KV cache data from the packed bytes format."""
         raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
         header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
@@ -336,6 +340,81 @@ class KVCacheTransferData:
     def from_bytes_gpu(tensor: torch.Tensor) -> dict[str, Any]:
         """Compatibility alias for callers using the old GPU-specific name."""
         return KVCacheTransferData.from_bytes_device(tensor)
+
+
+class PrefetchQueue:
+    """Background queue that drives KV prefetch as soon as requests arrive.
+
+    Decouples *when* the engine learns about a new request from *when* the
+    scheduler exposes it, so the prefetch window spans the full wait time
+    instead of a single step.  Fire-and-forget: the caller never blocks on
+    the result; ``consume_and_distribute_kv_cache`` picks up the prefetched
+    data later.
+
+    Thread-safety: all public methods are safe to call from any thread.
+    """
+
+    def __init__(self, manager: OmniKVTransferManager, target_device: torch.device | None = None) -> None:
+        self._manager = manager
+        self._device = target_device
+        self._queue: deque[tuple[str, dict[str, Any]]] = deque()
+        self._enqueued: set[str] = set()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._wakeup = threading.Event()
+        self._worker = threading.Thread(target=self._loop, daemon=True, name="kv-prefetch-queue")
+        self._worker.start()
+
+    def enqueue(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
+        """Idempotent enqueue — duplicate request_ids are silently skipped."""
+        with self._lock:
+            if request_id in self._enqueued:
+                return
+            self._enqueued.add(request_id)
+            self._queue.append((request_id, kv_sender_info))
+        self._wakeup.set()
+
+    def cancel(self, request_id: str) -> None:
+        """Mark *request_id* as cancelled so the worker skips / discards it."""
+        with self._lock:
+            self._enqueued.discard(request_id)
+
+    def close(self) -> None:
+        """Stop the background worker and wait for it to finish."""
+        self._closed = True
+        self._wakeup.set()
+        self._worker.join()
+
+    def _loop(self) -> None:
+        while not self._closed:
+            self._wakeup.wait(timeout=1.0)
+            self._wakeup.clear()
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        break
+                    request_id, sender_info = self._queue[0]
+                    still_enqueued = request_id in self._enqueued
+                # Cancelled entry — drop and move on.
+                if not still_enqueued:
+                    with self._lock:
+                        self._queue.popleft()
+                    continue
+                # OOM waterline check — stop draining until memory frees up.
+                if not self._manager._has_enough_prefetch_device_mem(self._device):
+                    logger.debug(
+                        "PrefetchQueue: pausing — device free mem below %.2f",
+                        self._manager._prefetch_min_free_mem_ratio,
+                    )
+                    break
+                # Submit the prefetch (non-blocking on the caller side; the
+                # executor's single-worker serialises actual I/O).
+                self._manager.start_prefetch(
+                    {"request_id": request_id, "kv_sender_info": sender_info},
+                    target_device=self._device,
+                )
+                with self._lock:
+                    self._queue.popleft()
 
 
 class OmniKVTransferManager:
@@ -405,6 +484,9 @@ class OmniKVTransferManager:
         self._prefetch_futures: dict[str, Any] = {}
         self._bg_copy_stream: current_omni_platform.Stream | None = None
 
+        # PrefetchQueue — lazily created via init_prefetch_queue().
+        self._prefetch_queue: PrefetchQueue | None = None
+
         self._topo_config: _TransferTopoConfig | None = None
 
         if config.need_send_cache and config.connector_config:
@@ -426,7 +508,7 @@ class OmniKVTransferManager:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> "OmniKVTransferManager":
+    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> OmniKVTransferManager:
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
             return cls(OmniKVCacheConfig(), async_prefetch=async_prefetch)
@@ -471,7 +553,7 @@ class OmniKVTransferManager:
         return not (has_companion or cls._receiver_pool_on_device(omni_kv))
 
     @classmethod
-    def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
+    def from_od_config(cls, config: Any) -> OmniKVTransferManager:
         """Create from model or OmniDiffusion config."""
         omni_kv = getattr(config, "omni_kv_config", None)
         has_companion = getattr(config, "cfg_kv_collect_func", None) is not None
@@ -481,7 +563,7 @@ class OmniKVTransferManager:
     from_model_config = from_od_config
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> "OmniKVTransferManager":
+    def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> OmniKVTransferManager:
         """Create from vllm config with fallback to kv_transfer_config."""
         # Primary: omni_kv_config on model_config — same shape as from_od_config.
         if isinstance(getattr(model_config, "omni_kv_config", None), dict):
@@ -1128,7 +1210,7 @@ class OmniKVTransferManager:
         from_stage: str,
         to_stage: str,
         put_key: str,
-        data: "dict[str, Any] | bytes | torch.Tensor",
+        data: dict[str, Any] | bytes | torch.Tensor,
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Transfer data with retry and exponential backoff.
@@ -1298,6 +1380,9 @@ class OmniKVTransferManager:
 
     def shutdown_prefetch(self) -> None:
         """Cancel pending prefetches and stop the executor (call on teardown)."""
+        if self._prefetch_queue is not None:
+            self._prefetch_queue.close()
+            self._prefetch_queue = None
         for rid in list(self._prefetch_futures):
             self._discard_future(rid)
         if self._prefetch_executor is not None:
@@ -1306,6 +1391,25 @@ class OmniKVTransferManager:
             except Exception:
                 logger.exception("Failed to shut down KV prefetch executor")
             self._prefetch_executor = None
+
+    def init_prefetch_queue(self, target_device: torch.device | None = None) -> None:
+        """Create the PrefetchQueue (call once during runner initialisation)."""
+        if not self._async_prefetch or self._prefetch_queue is not None:
+            return
+        self._prefetch_queue = PrefetchQueue(self, target_device=target_device)
+        logger.info("KV PrefetchQueue initialised (target_device=%s)", target_device)
+
+    def enqueue_prefetch(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
+        """Enqueue a request for background KV prefetch.
+
+        Called by the model runner when it receives a fire-and-forget
+        ``prefetch`` message from the engine.  Safe to call from any
+        thread; O(1) when the request is already queued (idempotent).
+        """
+        if self._prefetch_queue is None:
+            logger.debug("PrefetchQueue not initialised — skipping enqueue for %s", request_id)
+            return
+        self._prefetch_queue.enqueue(request_id, kv_sender_info)
 
     @staticmethod
     def _record_stream_for_prefetched(data: dict[str, Any]) -> None:

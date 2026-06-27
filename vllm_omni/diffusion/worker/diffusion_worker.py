@@ -881,6 +881,12 @@ class WorkerProc:
                     if self.result_mq is not None:
                         self.return_result({"status": "error", "error": str(e)})
 
+            elif isinstance(msg, dict) and msg.get("type") == "prefetch":
+                request_id = msg.get("request_id", "")
+                kv_sender_info = msg.get("kv_sender_info", {})
+                if self.worker.model_runner is not None:
+                    self.worker.model_runner.enqueue_prefetch(request_id, kv_sender_info)
+
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
                 self._running = False

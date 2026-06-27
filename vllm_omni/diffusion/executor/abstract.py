@@ -104,6 +104,13 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
+        """Fire-and-forget: tell workers to start KV prefetch for *request_id*.
+
+        Executors that do not support prefetch can keep the default no-op.
+        """
+        return None
+
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the executor and release resources."""

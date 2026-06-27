@@ -418,6 +418,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"RPC call failed: {e}")
             raise
 
+    def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
+        """Fire-and-forget: tell workers to start KV prefetch for *request_id*.
+
+        Enqueues a ``prefetch`` message via the broadcast MQ.  Workers handle
+        it in their busy loop and forward the request to the PrefetchQueue.
+        No result is expected — the prefetched data is consumed later by
+        ``consume_and_distribute_kv_cache``.
+        """
+        self._ensure_open()
+        msg = {
+            "type": "prefetch",
+            "request_id": request_id,
+            "kv_sender_info": kv_sender_info,
+        }
+        self._broadcast_mq.enqueue(msg)
+
     def check_health(self) -> None:
         if self.is_failed:
             raise EngineDeadError()
