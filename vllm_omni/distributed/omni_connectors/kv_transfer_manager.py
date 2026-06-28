@@ -859,7 +859,9 @@ class OmniKVTransferManager:
         padding = None
         if not branch_roles and cfg_size == 2 and main_payload:
             # AR didn't split KV by branch; cfg follower needs the same
-            # positive KV for shared-prefix reuse.
+            # positive KV for shared-prefix reuse. Only safe for cfg_size == 2:
+            # for cfg_size > 2 every rank must get its own KV, which we can't
+            # assign here, so padding stays None and the runner raises.
             padding = dict(main_payload)
         while len(payloads) < cfg_size:
             payloads.append(padding)

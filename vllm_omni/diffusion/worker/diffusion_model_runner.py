@@ -326,8 +326,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             if self.kv_transfer_manager.config.need_recv_cache and not kv_received:
                 raise RuntimeError(
-                    f"KV cache receive failed for request {req.request_id}, "
-                    f"but the stage requires KV transfer"
+                    f"KV cache receive failed for request {req.request_id}, but the stage requires KV transfer"
                 )
 
             # Kick off the next request's prefetch (+ H2D) to overlap this forward.

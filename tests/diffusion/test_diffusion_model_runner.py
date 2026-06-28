@@ -103,6 +103,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         streaming_output=False,
     )
     runner.kv_transfer_manager = SimpleNamespace(
+        config=SimpleNamespace(need_recv_cache=False),
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
         receive_multi_kv_cache_distributed=lambda *a, **k: None,
@@ -236,6 +237,43 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 
     assert output.output == "ok"
     assert cache_summary_calls == [(runner.pipeline, True)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_raises_when_required_kv_not_received():
+    """A stage that needs KV must fail loudly when the receive returns falsy,
+    instead of silently running the forward without KV cache."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.kv_transfer_manager.config.need_recv_cache = True
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = lambda *a, **k: False
+    req = _make_request(skip_cache_refresh=True)
+
+    with pytest.raises(RuntimeError, match="KV cache receive failed"):
+        DiffusionModelRunner.execute_model(runner, req)
+
+    # The forward must not run when the required KV is missing.
+    assert runner.pipeline.forward_calls == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_execute_model_proceeds_when_required_kv_received(monkeypatch):
+    """When the required KV is received, execute_model runs normally."""
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.kv_transfer_manager.config.need_recv_cache = True
+    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = lambda *a, **k: True
+    req = _make_request(skip_cache_refresh=True)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "ok"
+    assert runner.pipeline.forward_calls == 1
 
 
 @pytest.mark.core_model
