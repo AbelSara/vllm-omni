@@ -1250,6 +1250,7 @@ class OmniKVTransferManager:
         """
         if not self._has_enough_prefetch_device_mem(target_device):
             logger.info("Prefetch skipped — device free mem below %.2f", self._prefetch_min_free_mem_ratio)
+            return None, 0
 
         try:
             on_device = target_device is not None and target_device.type != "cpu"
@@ -1327,6 +1328,7 @@ class OmniKVTransferManager:
             except Exception:
                 logger.exception("Failed to shut down KV prefetch executor")
             self._prefetch_executor = None
+        self._prefetch_lock = None
 
     def _prefetch_gc(self, now: float) -> None:
         """Drop expired _settled entries."""
