@@ -94,13 +94,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
 
     def init_prefetch_queue(self) -> None:
-        """Initialise the background PrefetchQueue (call after load_model)."""
+        """Initialise the background PrefetchManager (call after load_model)."""
         if self._kv_prefetch_enabled:
             self.kv_transfer_manager.init_prefetch_queue(target_device=self.target_device)
 
     def enqueue_prefetch(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
-        """Forward a fire-and-forget prefetch notification to the PrefetchQueue."""
+        """Forward a fire-and-forget prefetch notification to the PrefetchManager."""
         self.kv_transfer_manager.enqueue_prefetch(request_id, kv_sender_info)
+
+    def abort_prefetch(self, request_id: str) -> None:
+        """Abort prefetch for a request (control-channel kv_prefetch_cancel)."""
+        self.kv_transfer_manager.abort_prefetch(request_id)
+
+    def forget_prefetch(self, request_id: str) -> None:
+        """Drop residual prefetch state on normal request finish (defensive)."""
+        if self._kv_prefetch_enabled:
+            self.kv_transfer_manager.forget_prefetch(request_id)
 
     @property
     def target_device(self) -> torch.device | None:
@@ -293,7 +302,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -316,96 +325,100 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
-            # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
-            # consume prior-forward payload, sync-fallback on miss; else sync receive.
-            kv_recv_t0 = time.perf_counter()
-            if self._kv_prefetch_enabled:
-                self.kv_transfer_manager.consume_and_distribute_kv_cache(
-                    req,
-                    target_device=self.target_device,
-                )
-            else:
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
-            kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
-            logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
-
-            # Kick off the next request's prefetch (+ H2D) to overlap this forward.
-            if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
-                self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
-
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-
-            # Refresh cache context if needed
-            if (
-                not getattr(req, "skip_cache_refresh", False)
-                and self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-            ):
-                # FIXME (Alex): When num_inference_steps is None, we defer to
-                # pipelines for default, but don't refresh the cache; the right
-                # way to do this is to merge the sampling params first.
-                #
-                # For now, if num_inference_steps is not set, we pass 0 to allow
-                # TeaCache to refresh to align with the param signature. This is
-                # okay to force refresh TeaCache because the refresh does not use
-                # num_inference_steps at all (i.e., just resets state and clears
-                # stale residuals).
-                num_inference_steps = req.sampling_params.num_inference_steps
-                if num_inference_steps is None and self.od_config.cache_backend in (
-                    "tea_cache",
-                    "step_cache",
-                ):
-                    # TeaCache refresh ignores the value; step_cache refresh is a
-                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
-                    # leaves sampling_params.num_inference_steps unset and uses the
-                    # pipeline default instead.
-                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
-
-                if num_inference_steps is not None:
-                    self.cache_backend.refresh(self.pipeline, num_inference_steps)
-                else:
-                    logger.warning(
-                        "Failed to refresh the diffusion transformer cache; backend %s "
-                        "currently requires num_inference_steps to be passed explicitly",
-                        self.od_config.cache_backend,
+        try:
+            with grad_context:
+                # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
+                # consume prior-forward payload, sync-fallback on miss; else sync receive.
+                kv_recv_t0 = time.perf_counter()
+                if self._kv_prefetch_enabled:
+                    self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                        req,
+                        target_device=self.target_device,
                     )
+                else:
+                    self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                        req,
+                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        target_device=self.target_device,
+                    )
+                kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
+                logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
-                current_omni_platform.reset_peak_memory_stats()
+                if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+                    if req.sampling_params.generator_device is not None:
+                        gen_device = req.sampling_params.generator_device
+                    elif self.device.type == "cpu":
+                        gen_device = "cpu"
+                    else:
+                        gen_device = self.device
+                    gen = torch.Generator(device=gen_device)
+                    gen.manual_seed(req.sampling_params.seed)
+                    req.sampling_params.generator = gen
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                # Refresh cache context if needed
+                if (
+                    not getattr(req, "skip_cache_refresh", False)
+                    and self.cache_backend is not None
+                    and self.cache_backend.is_enabled()
+                ):
+                    # FIXME (Alex): When num_inference_steps is None, we defer to
+                    # pipelines for default, but don't refresh the cache; the right
+                    # way to do this is to merge the sampling params first.
+                    #
+                    # For now, if num_inference_steps is not set, we pass 0 to allow
+                    # TeaCache to refresh to align with the param signature. This is
+                    # okay to force refresh TeaCache because the refresh does not use
+                    # num_inference_steps at all (i.e., just resets state and clears
+                    # stale residuals).
+                    num_inference_steps = req.sampling_params.num_inference_steps
+                    if num_inference_steps is None and self.od_config.cache_backend in (
+                        "tea_cache",
+                        "step_cache",
+                    ):
+                        # TeaCache refresh ignores the value; step_cache refresh is a
+                        # no-op (per-chunk state resets in the denoise loop). DreamZero often
+                        # leaves sampling_params.num_inference_steps unset and uses the
+                        # pipeline default instead.
+                        num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
-            if is_primary:
-                self._record_peak_memory(output)
+                    if num_inference_steps is not None:
+                        self.cache_backend.refresh(self.pipeline, num_inference_steps)
+                    else:
+                        logger.warning(
+                            "Failed to refresh the diffusion transformer cache; backend %s "
+                            "currently requires num_inference_steps to be passed explicitly",
+                            self.od_config.cache_backend,
+                        )
 
-            # Log prompt-embed cache activity (hits/misses accumulate across requests).
-            if is_primary and self.prompt_embed_cache is not None:
-                logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
+                is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+                if is_primary:
+                    current_omni_platform.reset_peak_memory_stats()
 
-            # NOTE:
-            if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and self.od_config.cache_backend == "cache_dit"
-                and self.od_config.enable_cache_dit_summary
-            ):
-                cache_summary(self.pipeline, details=True)
-            return output
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    with record_function("pipeline_forward"):
+                        output = self.pipeline.forward(req)
+
+                if is_primary:
+                    self._record_peak_memory(output)
+
+                # Log prompt-embed cache activity (hits/misses accumulate across requests).
+                if is_primary and self.prompt_embed_cache is not None:
+                    logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
+
+                # NOTE:
+                if (
+                    self.cache_backend is not None
+                    and self.cache_backend.is_enabled()
+                    and self.od_config.cache_backend == "cache_dit"
+                    and self.od_config.enable_cache_dit_summary
+                ):
+                    cache_summary(self.pipeline, details=True)
+                return output
+        finally:
+            # Drop residual prefetch state for this request (defensive: on the
+            # happy path consume already popped the future). try/finally covers
+            # the exception path too so _settled/futures don't leak.
+            self.forget_prefetch(req.request_id)
 
     # ------------------------------------------------------------------
     # Step-wise execution
@@ -421,6 +434,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(request_id, None)
+            # Drop residual prefetch state for the finished request.
+            self.forget_prefetch(request_id)
 
         resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []

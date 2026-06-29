@@ -36,6 +36,7 @@ class BackgroundResources:
 
     broadcast_mq: MessageQueue | None = None
     result_mq: MessageQueue | None = None
+    control_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
 
@@ -54,6 +55,16 @@ class BackgroundResources:
                 self.result_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
+
+        # Lightweight control channel: tell each worker's reader thread to exit.
+        if self.control_mq is not None:
+            try:
+                for _ in range(self.num_workers):
+                    self.control_mq.enqueue({"type": "shutdown"}, timeout=1.0)
+            except Exception as exc:
+                logger.warning("Failed to send control-channel shutdown: %s", exc)
+            finally:
+                self.control_mq = None
 
         if self.processes:
             for proc in self.processes:
@@ -80,15 +91,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
+        # Lightweight control channel: fire-and-forget control signals
+        # (e.g. kv_prefetch / kv_prefetch_cancel) delivered on a queue that is
+        # NOT serviced by the busy loop, so signals land even mid-forward.
+        self._control_mq = self._init_control_queue(num_workers)
+        control_handle = self._control_mq.export_handle()
 
         # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle, self.wake_events)
+        processes, result_handle = self._launch_workers(broadcast_handle, control_handle, self.wake_events)
         self._result_mq = self._init_result_queue(result_handle)
         self._processes = processes
 
         self.resources = BackgroundResources(
             broadcast_mq=self._broadcast_mq,
             result_mq=self._result_mq,
+            control_mq=self._control_mq,
             num_workers=num_workers,
             processes=self._processes,
         )
@@ -102,6 +119,23 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             n_local_reader=num_workers,
             local_reader_ranks=list(range(num_workers)),
         )
+
+    def _init_control_queue(self, num_workers: int) -> MessageQueue:
+        # Mirror of _init_broadcast_queue: one reader per worker, all local.
+        return MessageQueue(
+            n_reader=num_workers,
+            n_local_reader=num_workers,
+            local_reader_ranks=list(range(num_workers)),
+        )
+
+    def send_control(self, msg: dict) -> None:
+        """Fire-and-forget control signal on the lightweight channel.
+
+        Never expect a reply: control ops that need a result must go through
+        the main-channel RPC instead. Safe to call from any thread.
+        """
+        self._ensure_open()
+        self._control_mq.enqueue(msg)
 
     def _init_result_queue(self, result_handle) -> MessageQueue | None:
         if result_handle is None:
@@ -183,7 +217,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         MultiprocDiffusionExecutor._raise_for_rpc_error_dict(response)
         return response
 
-    def _launch_workers(self, broadcast_handle, wake_events):
+    def _launch_workers(self, broadcast_handle, control_handle, wake_events):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -209,6 +243,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    control_handle,
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
@@ -321,7 +356,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(
             "execute_model",
-            args=(new_req.req, self.od_config, getattr(scheduler_output, "kv_prefetch_jobs", None)),
+            args=(new_req.req, self.od_config),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
@@ -421,18 +456,19 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
         """Fire-and-forget: tell workers to start KV prefetch for *request_id*.
 
-        Enqueues a ``prefetch`` message via the broadcast MQ.  Workers handle
-        it in their busy loop and forward the request to the PrefetchQueue.
-        No result is expected — the prefetched data is consumed later by
+        Routed via the lightweight control channel (not the broadcast MQ) so
+        the signal is delivered to the worker's control reader thread even
+        while the busy loop is blocked inside a forward. No result is expected
+        — the prefetched data is consumed later by
         ``consume_and_distribute_kv_cache``.
         """
-        self._ensure_open()
-        msg = {
-            "type": "prefetch",
-            "request_id": request_id,
-            "kv_sender_info": kv_sender_info,
-        }
-        self._broadcast_mq.enqueue(msg)
+        self.send_control(
+            {
+                "type": "kv_prefetch",
+                "request_id": request_id,
+                "kv_sender_info": kv_sender_info,
+            }
+        )
 
     def check_health(self) -> None:
         if self.is_failed:
@@ -450,5 +486,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         finally:
             self._broadcast_mq = None
             self._result_mq = None
+            self._control_mq = None
             self.resources = None
             self._processes = []

@@ -111,6 +111,14 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def send_control(self, msg: dict) -> None:
+        """Fire-and-forget control signal on the lightweight channel.
+
+        Default no-op for executors without a control channel (e.g. the
+        multiproc executor overrides this to enqueue onto ``_control_mq``).
+        """
+        return None
+
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the executor and release resources."""

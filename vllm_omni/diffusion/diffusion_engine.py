@@ -932,6 +932,14 @@ class DiffusionEngine:
         for request_id in dict.fromkeys(request_ids):
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+                # Tell workers to abort any in-flight/background prefetch for this
+                # request via the lightweight control channel (fire-and-forget).
+                # kv_prefetch may already have reached the worker even though the
+                # request is now aborted; the cancel drops it.
+                try:
+                    self.executor.send_control({"type": "kv_prefetch_cancel", "request_id": request_id})
+                except Exception:
+                    logger.debug("kv_prefetch_cancel failed for %s (non-fatal)", request_id, exc_info=True)
 
     def _finalize_finished_request(
         self,
