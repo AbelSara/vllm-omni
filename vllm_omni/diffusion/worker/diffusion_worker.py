@@ -858,10 +858,12 @@ class WorkerProc:
         runner = self.worker.model_runner
         if runner is None:
             return
-        self._control_handlers["kv_prefetch"] = lambda m: runner.enqueue_prefetch(
+        self._control_handlers["kv_prefetch"] = lambda m: runner.kv_transfer_manager.prefetch_submit(
             m.get("request_id", ""), m.get("kv_sender_info", {})
         )
-        self._control_handlers["kv_prefetch_cancel"] = lambda m: runner.abort_prefetch(m.get("request_id", ""))
+        self._control_handlers["kv_prefetch_cancel"] = lambda m: runner.kv_transfer_manager.abort_prefetch(
+            m.get("request_id", "")
+        )
 
     def _control_loop(self) -> None:
         """Reader thread for the lightweight control channel.
@@ -934,12 +936,6 @@ class WorkerProc:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
                         self.return_result({"status": "error", "error": str(e)})
-
-            elif isinstance(msg, dict) and msg.get("type") == "prefetch":
-                request_id = msg.get("request_id", "")
-                kv_sender_info = msg.get("kv_sender_info", {})
-                if self.worker.model_runner is not None:
-                    self.worker.model_runner.enqueue_prefetch(request_id, kv_sender_info)
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

@@ -540,14 +540,12 @@ class DiffusionEngine:
                 self._out_queue_streaming[request_id] = queue
             self._cv.notify_all()
 
-        # Fire-and-forget: trigger KV prefetch as early as possible so the
-        # background fetch overlaps with the forward of running requests.
         kv_sender_info = getattr(request, "kv_sender_info", None)
         if kv_sender_info:
             try:
                 self.executor.notify_prefetch(request_id, kv_sender_info)
             except Exception:
-                logger.debug("notify_prefetch failed for %s (non-fatal)", request_id, exc_info=True)
+                logger.exception("notify_prefetch failed for %s (non-fatal)", request_id, exc_info=True)
 
         return request_id
 
@@ -600,14 +598,6 @@ class DiffusionEngine:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             target_request_id = self.scheduler.add_request(request)
-
-            # Fire-and-forget prefetch for the sync path too.
-            kv_sender_info = getattr(request, "kv_sender_info", None)
-            if kv_sender_info:
-                try:
-                    self.executor.notify_prefetch(target_request_id, kv_sender_info)
-                except Exception:
-                    logger.debug("notify_prefetch failed for %s (non-fatal)", target_request_id, exc_info=True)
 
             # keep scheduling and executing until the target request is finished
             while True:

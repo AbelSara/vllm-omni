@@ -105,18 +105,11 @@ class DiffusionExecutor(ABC):
         return None
 
     def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
-        """Fire-and-forget: tell workers to start KV prefetch for *request_id*.
-
-        Executors that do not support prefetch can keep the default no-op.
-        """
+        """Fire-and-forget: tell workers to start KV prefetch for *request_id*."""
         return None
 
     def send_control(self, msg: dict) -> None:
-        """Fire-and-forget control signal on the lightweight channel.
-
-        Default no-op for executors without a control channel (e.g. the
-        multiproc executor overrides this to enqueue onto ``_control_mq``).
-        """
+        """Fire-and-forget control signal on the lightweight channel."""
         return None
 
     @abstractmethod

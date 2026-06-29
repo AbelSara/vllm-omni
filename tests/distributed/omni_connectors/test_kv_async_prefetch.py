@@ -1,6 +1,6 @@
 """Background KV prefetch — CPU-testable mechanism.
 
-Covers opt-in gating, the enqueue_prefetch / consume_prefetched_kv round trip over a
+Covers opt-in gating, the prefetch_submit / consume_prefetched_kv round trip over a
 mock connector, dedup, multi-future coexistence, miss (no _settled), abort (in-flight
 removal vs out-of-order _settled), forget, per-call sender_info isolation, role
 classification.  GPU H2D and D2D paths need CUDA (integration tests).
@@ -21,7 +21,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-# _submit_locked() skips stubs without a sender endpoint, so submissions carry it.
+# prefetch_submit() skips stubs without a sender endpoint, so submissions carry it.
 _SENDER_INFO = {"host": "127.0.0.1", "zmq_port": 50051}
 
 
@@ -127,41 +127,39 @@ def test_from_vllm_config_ar_path_is_always_sync():
 
 
 def _await_submitted(receiver, rid, timeout=5.0):
-    """Wait for PrefetchManager._loop to submit *rid*'s future (CPU-friendly poll)."""
+    """Wait for *rid*'s future to appear (CPU-friendly poll)."""
     import time
 
-    mgr = receiver._prefetch_manager
-    assert mgr is not None
+    assert receiver._prefetch_lock is not None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with mgr._lock:
-            if rid in mgr._futures:
-                return mgr._futures[rid]
+        with receiver._prefetch_lock:
+            if rid in receiver._prefetch_futures:
+                return receiver._prefetch_futures[rid]
         time.sleep(0.01)
     raise AssertionError(f"prefetch for {rid} was not submitted within {timeout}s")
 
 
-def _await_drained(receiver, rid, timeout=5.0):
-    """Wait for *rid* to be removed from the pending queue (SKIP/WAIT_MEM path)."""
+def _await_no_future(receiver, rid, timeout=5.0):
+    """Wait for *rid* to be absent from futures (SKIP path)."""
     import time
 
-    mgr = receiver._prefetch_manager
-    assert mgr is not None
+    assert receiver._prefetch_lock is not None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with mgr._lock:
-            if rid not in mgr._queue:
+        with receiver._prefetch_lock:
+            if rid not in receiver._prefetch_futures:
                 return
         time.sleep(0.01)
     raise AssertionError(f"prefetch for {rid} was not drained within {timeout}s")
 
 
-def test_enqueue_prefetch_noop_when_disabled():
+def test_prefetch_submit_noop_when_disabled():
     _, receiver, _ = _make_sender_receiver(async_prefetch=False)
-    # PrefetchManager is not created when async_prefetch is False.
-    assert receiver._prefetch_manager is None
-    receiver.enqueue_prefetch("r1", _SENDER_INFO)  # no-op, must not raise
-    receiver.consume_prefetched_kv(_req("r1")) == (None, 0)
+    # Prefetch state is not created when async_prefetch is False.
+    assert receiver._prefetch_lock is None
+    receiver.prefetch_submit("r1", _SENDER_INFO)  # no-op, must not raise
+    assert receiver.consume_prefetched_kv(_req("r1")) == (None, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,10 +169,10 @@ def test_enqueue_prefetch_noop_when_disabled():
 
 def test_prefetch_round_trip_returns_data():
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-1")
 
-    receiver.enqueue_prefetch("rid-1", _SENDER_INFO)
+    receiver.prefetch_submit("rid-1", _SENDER_INFO)
     _await_submitted(receiver, "rid-1")
 
     data, size = receiver.consume_prefetched_kv(_req("rid-1"))
@@ -183,7 +181,7 @@ def test_prefetch_round_trip_returns_data():
     assert data["metadata"]["seq_len"] == 10
     assert size > 0
     # Future is consumed (popped) on retrieval.
-    assert "rid-1" not in receiver._prefetch_manager._futures
+    assert "rid-1" not in receiver._prefetch_futures
 
 
 def test_consume_prefetched_kv_miss_without_prefetch_returns_none():
@@ -191,89 +189,76 @@ def test_consume_prefetched_kv_miss_without_prefetch_returns_none():
     assert receiver.consume_prefetched_kv(_req("never-prefetched")) == (None, 0)
 
 
-def test_enqueue_prefetch_dedups_same_request():
+def test_prefetch_submit_dedups_same_request():
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-dup")
-    receiver.enqueue_prefetch("rid-dup", _SENDER_INFO)
+    receiver.prefetch_submit("rid-dup", _SENDER_INFO)
     fut1 = _await_submitted(receiver, "rid-dup")
-    # Second enqueue is idempotent (dedup at queue / in-flight).
-    receiver.enqueue_prefetch("rid-dup", _SENDER_INFO)
-    assert receiver._prefetch_manager._futures["rid-dup"] is fut1
+    # Second enqueue is idempotent (dedup in-flight).
+    receiver.prefetch_submit("rid-dup", _SENDER_INFO)
+    assert receiver._prefetch_futures["rid-dup"] is fut1
 
 
 def test_consume_does_not_drop_other_futures():
     # Multi-future coexistence: consuming one must not discard another.
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-a")
     _seed_payload(sender, "rid-b")
-    receiver.enqueue_prefetch("rid-a", _SENDER_INFO)
-    receiver.enqueue_prefetch("rid-b", _SENDER_INFO)
+    receiver.prefetch_submit("rid-a", _SENDER_INFO)
+    receiver.prefetch_submit("rid-b", _SENDER_INFO)
     _await_submitted(receiver, "rid-a")
     _await_submitted(receiver, "rid-b")
 
     data_a, _ = receiver.consume_prefetched_kv(_req("rid-a"))
     assert data_a is not None
     # rid-b must still be present (no serial sweep).
-    assert "rid-b" in receiver._prefetch_manager._futures
+    assert "rid-b" in receiver._prefetch_futures
 
 
 def test_consume_miss_does_not_settle():
     # Serialisation: a miss must NOT add to _settled (no orphan-future window).
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-miss")
     assert receiver.consume_prefetched_kv(_req("rid-miss")) == (None, 0)
-    assert "rid-miss" not in receiver._prefetch_manager._settled
+    assert "rid-miss" not in receiver._prefetch_settled
 
 
 def test_abort_removes_inflight_future():
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-abort")
-    receiver.enqueue_prefetch("rid-abort", _SENDER_INFO)
+    receiver.prefetch_submit("rid-abort", _SENDER_INFO)
     _await_submitted(receiver, "rid-abort")
 
     receiver.abort_prefetch("rid-abort")
     # rid present in queue/futures → physically removed, NOT added to _settled.
-    assert "rid-abort" not in receiver._prefetch_manager._futures
-    assert "rid-abort" not in receiver._prefetch_manager._settled
+    assert "rid-abort" not in receiver._prefetch_futures
+    assert "rid-abort" not in receiver._prefetch_settled
 
 
 def test_abort_out_of_order_records_settled():
-    # abort for a rid NOT in queue/futures (out-of-order) → recorded in _settled
+    # abort for a rid NOT in futures (out-of-order) → recorded in _settled
     # to block a late kv_prefetch.
     _, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     receiver.abort_prefetch("rid-ooo")
-    assert "rid-ooo" in receiver._prefetch_manager._settled
+    assert "rid-ooo" in receiver._prefetch_settled
     # Late prefetch is refused (no resurrection).
-    receiver.enqueue_prefetch("rid-ooo", _SENDER_INFO)
-    assert "rid-ooo" not in receiver._prefetch_manager._queue
-    assert "rid-ooo" not in receiver._prefetch_manager._futures
-
-
-def test_forget_clears_settled_and_residual_future():
-    sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
-    _seed_payload(sender, "rid-fg")
-    receiver.enqueue_prefetch("rid-fg", _SENDER_INFO)
-    _await_submitted(receiver, "rid-fg")
-    receiver.abort_prefetch("rid-fg")  # not present now → settled
-    receiver.forget_prefetch("rid-fg")
-    assert "rid-fg" not in receiver._prefetch_manager._settled
-    assert "rid-fg" not in receiver._prefetch_manager._futures
+    receiver.prefetch_submit("rid-ooo", _SENDER_INFO)
+    assert "rid-ooo" not in receiver._prefetch_futures
 
 
 def test_shutdown_prefetch_clears_state():
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-sd")
-    receiver.enqueue_prefetch("rid-sd", _SENDER_INFO)
+    receiver.prefetch_submit("rid-sd", _SENDER_INFO)
     _await_submitted(receiver, "rid-sd")
     receiver.shutdown_prefetch()
-    assert receiver._prefetch_manager is None
+    assert receiver._prefetch_executor is None
 
 
 # --------------------------------------------------------------------------- #
@@ -387,33 +372,33 @@ def test_recv_role_uninitialized_defaults_local(monkeypatch):
 
 
 def test_prefetch_skips_follower(monkeypatch):
-    # A follower never pulls, so _submit_locked returns SKIP (no future).
+    # A follower never pulls, so _submit_locked skips (no future).
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-fol")
     _set_tp(receiver, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=1)
-    receiver.enqueue_prefetch("rid-fol", _SENDER_INFO)
-    _await_drained(receiver, "rid-fol")
-    assert receiver._prefetch_manager._futures == {}
+    receiver.prefetch_submit("rid-fol", _SENDER_INFO)
+    _await_no_future(receiver, "rid-fol")
+    assert receiver._prefetch_futures == {}
 
 
 def test_prefetch_submits_for_owner(monkeypatch):
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-own")
     _set_tp(receiver, 2, 2)
     _patch_topo(monkeypatch, world_size=4, cfg_size=2, cfg_rank=0)
-    receiver.enqueue_prefetch("rid-own", _SENDER_INFO)
+    receiver.prefetch_submit("rid-own", _SENDER_INFO)
     _await_submitted(receiver, "rid-own")
-    assert "rid-own" in receiver._prefetch_manager._futures
+    assert "rid-own" in receiver._prefetch_futures
 
 
 def test_consume_then_apply_attaches_payload():
     sender, receiver, _ = _make_sender_receiver()
-    receiver.init_prefetch_queue(target_device=None)
+    receiver.init_prefetch(target_device=None)
     _seed_payload(sender, "rid-apply")
-    receiver.enqueue_prefetch("rid-apply", _SENDER_INFO)
+    receiver.prefetch_submit("rid-apply", _SENDER_INFO)
     _await_submitted(receiver, "rid-apply")
     data, _ = receiver.consume_prefetched_kv(_req("rid-apply"))
     assert data is not None

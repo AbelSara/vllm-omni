@@ -91,9 +91,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
-        # Lightweight control channel: fire-and-forget control signals
-        # (e.g. kv_prefetch / kv_prefetch_cancel) delivered on a queue that is
-        # NOT serviced by the busy loop, so signals land even mid-forward.
+
         self._control_mq = self._init_control_queue(num_workers)
         control_handle = self._control_mq.export_handle()
 
@@ -121,7 +119,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
 
     def _init_control_queue(self, num_workers: int) -> MessageQueue:
-        # Mirror of _init_broadcast_queue: one reader per worker, all local.
         return MessageQueue(
             n_reader=num_workers,
             n_local_reader=num_workers,
@@ -129,11 +126,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         )
 
     def send_control(self, msg: dict) -> None:
-        """Fire-and-forget control signal on the lightweight channel.
-
-        Never expect a reply: control ops that need a result must go through
-        the main-channel RPC instead. Safe to call from any thread.
-        """
         self._ensure_open()
         self._control_mq.enqueue(msg)
 
@@ -454,14 +446,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def notify_prefetch(self, request_id: str, kv_sender_info: dict) -> None:
-        """Fire-and-forget: tell workers to start KV prefetch for *request_id*.
-
-        Routed via the lightweight control channel (not the broadcast MQ) so
-        the signal is delivered to the worker's control reader thread even
-        while the busy loop is blocked inside a forward. No result is expected
-        — the prefetched data is consumed later by
-        ``consume_and_distribute_kv_cache``.
-        """
         self.send_control(
             {
                 "type": "kv_prefetch",

@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unified OmniConnector and KV cache transfer management."""
 
-from __future__ import annotations
-
 import enum
 import json
 import struct
 import threading
 import time
-from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -312,7 +309,7 @@ class KVCacheTransferData:
         }
 
     @staticmethod
-    def from_bytes(raw: bytes | bytearray | memoryview) -> dict[str, Any]:
+    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
         """Reconstruct KV cache data from the packed bytes format."""
         raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
         header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
@@ -342,271 +339,6 @@ class KVCacheTransferData:
         return KVCacheTransferData.from_bytes_device(tensor)
 
 
-class PrefetchManager:
-    """Single-lock manager for all KV prefetch state.
-
-    Owns the pending-queue (OrderedDict, FIFO + O(1) delete), in-flight
-    futures, the single-worker executor and the dedicated bg copy stream.
-    ``_settled`` only holds rids whose abort arrived out-of-order (cancel
-    before the matching kv_prefetch) — it is *not* used for consume-miss
-    (serialisation removes that race).
-
-    Thread-safety: all state is guarded by ``self._lock``. State mutations
-    (queue add/remove, future submit/pop, _settled add/remove) are atomic
-    under the lock. Only non-blocking calls are allowed inside the lock
-    (``executor.submit`` and the memory-waterline check are non-blocking);
-    ``fut.result()``, ``synchronize()`` and ``connector.get`` must run
-    outside the lock (holding the lock while waiting on a future that runs
-    on the executor thread would deadlock).
-
-    The key correctness invariant: ``_submit_locked`` runs entirely under
-    ``self._lock``, so ``_loop``'s "peek head → submit" is atomic — a
-    concurrent ``consume`` cannot sneak in between peek and submit, which
-    removes the orphan-future window that would otherwise need a settled
-    marker on miss.
-    """
-
-    _SETTLED_TTL_S = 60.0
-
-    def __init__(self, manager: OmniKVTransferManager, target_device: torch.device | None = None) -> None:
-        self._manager = manager
-        self._device = target_device
-        self._lock = threading.Lock()
-        self._wakeup = threading.Event()
-        self._closed = False
-        # Pending queue: rid -> sender_info. OrderedDict keeps FIFO order and
-        # gives O(1) delete-by-rid (no separate _enqueued set needed).
-        self._queue: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # In-flight (already submitted) futures.
-        self._futures: dict[str, Any] = {}
-        # Settled rids (abort out-of-order only): rid -> settle time. TTL-cleaned.
-        self._settled: dict[str, float] = {}
-        # Single-worker executor + dedicated bg copy stream (moved from manager).
-        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch")
-        self._bg_copy_stream: current_omni_platform.Stream | None = None
-        self._worker = threading.Thread(target=self._loop, daemon=True, name="kv-prefetch-mgr")
-        self._worker.start()
-
-    # ------------------------------------------------------------------ #
-    #  Public API (called from control-channel reader thread / busy loop)
-    # ------------------------------------------------------------------ #
-
-    def enqueue(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
-        """Fire-and-forget enqueue. Idempotent; rejects resurrected (settled) rids."""
-        with self._lock:
-            if request_id in self._settled:
-                # Abort arrived out-of-order (cancel before kv_prefetch): refuse
-                # the late prefetch to avoid resurrecting a cancelled request.
-                return
-            if request_id in self._queue or request_id in self._futures:
-                return  # idempotent dedup
-            self._queue[request_id] = kv_sender_info
-        self._wakeup.set()
-
-    def consume(self, request_id: str) -> tuple[dict[str, Any] | None, int]:
-        """Consume rid's prefetched KV; (None, 0) on miss / recoverable failure.
-
-        Raises ``KVPrefetchConsumeError`` when the payload was consumed from
-        the connector but post-get processing failed (no sync-receive retry).
-
-        Miss does NOT add to _settled: serialisation (_submit_locked fully
-        under the lock) means _loop cannot submit this rid once we've removed
-        it from the queue here, so there is no orphan-future window.
-        """
-        if not request_id:
-            return None, 0
-        with self._lock:
-            # Physically drop the pending queue entry (if any) so _loop won't
-            # submit it, and pop the in-flight future (if any).
-            self._queue.pop(request_id, None)
-            fut = self._futures.pop(request_id, None)
-        if fut is None:
-            return None, 0  # miss → caller falls back to sync receive
-        # Result wait runs outside the lock (future runs on the executor thread).
-        try:
-            return fut.result()  # payload synchronised its bg stream before returning
-        except KVPrefetchConsumeError:
-            logger.exception("KV load failed for %s (payload consumed, cannot retry)", request_id)
-            raise
-        except Exception:
-            logger.exception("KV load failed for %s; falling back to sync receive", request_id)
-            return None, 0
-
-    def abort(self, request_id: str) -> None:
-        """Abort prefetch for *request_id* (control-channel kv_prefetch_cancel).
-
-        If the rid is in the queue/futures, physically remove it (like a
-        consume). Only when the rid is *not* present (out-of-order: cancel
-        arrived before kv_prefetch) do we record it in _settled to block the
-        late prefetch.
-        """
-        with self._lock:
-            existed = self._remove_locked(request_id)
-            if not existed:
-                self._settled[request_id] = time.monotonic()
-
-    def forget(self, request_id: str) -> None:
-        """Cleanup on normal request finish: drop residual queue/future + _settled.
-
-        On the happy path consume already popped the future and miss never
-        touched _settled, so this is mostly defensive. Must be called in a
-        try/finally so exception paths still clean up.
-        """
-        with self._lock:
-            self._remove_locked(request_id)
-            self._settled.pop(request_id, None)
-
-    def close(self) -> None:
-        """Teardown: stop the loop, cancel futures, shut the executor, drop refs."""
-        self._closed = True
-        self._wakeup.set()
-        self._worker.join()
-        with self._lock:
-            for rid in list(self._futures):
-                self._discard_future_locked(rid)
-            self._futures.clear()
-            self._settled.clear()
-            self._queue.clear()
-        if self._executor is not None:
-            try:
-                # wait=True: executor worker threads are non-daemon; without
-                # shutdown they block process exit (atexit join). Waiting lets
-                # in-flight connector.get calls finish (bounded by recv_timeout).
-                self._executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
-                logger.exception("Failed to shut down KV prefetch executor")
-            self._executor = None
-        self._manager = None  # break PrefetchManager -> manager reference
-
-    # ------------------------------------------------------------------ #
-    #  Internals (callers must hold self._lock where marked)
-    # ------------------------------------------------------------------ #
-
-    def _discard_future_locked(self, request_id: str) -> None:
-        """Cancel an unstarted future; running ones are left to finish + GC.
-
-        Caller holds _lock. A running connector.get is destructive and cannot
-        be aborted — it will run to completion wasting one get (inherent
-        connector limitation, accepted). We do NOT attach a done-callback
-        that calls fut.result(): that would block the caller (reader thread).
-        """
-        fut = self._futures.pop(request_id, None)
-        if fut is not None:
-            fut.cancel()  # no-op (returns False) for already-running futures
-
-    def _remove_locked(self, request_id: str) -> bool:
-        """Physically drop queue entry + future. Caller holds _lock.
-
-        Returns True if the rid was present (in queue or futures).
-        """
-        in_queue = self._queue.pop(request_id, None) is not None
-        had_future = request_id in self._futures
-        self._discard_future_locked(request_id)
-        return in_queue or had_future
-
-    def _submit_locked(self, request_id: str, sender_info: dict[str, Any]) -> str:
-        """Submit a background prefetch. Caller holds _lock.
-
-        Returns "OK" (submitted / already in-flight), "WAIT_MEM" (waterline
-        not met — retry later), or "SKIP" (permanently unsubmitable).
-
-        Runs fully under the lock: the waterline check is non-blocking, so
-        _loop's "peek head -> submit" is atomic w.r.t. consume/abort.
-        """
-        mgr = self._manager
-        if mgr is None:
-            return "SKIP"
-        if not (mgr._async_prefetch and mgr.config.need_recv_cache):
-            return "SKIP"
-        if mgr.topo_config.is_follower:
-            return "SKIP"
-        if not mgr._has_enough_prefetch_device_mem(self._device):
-            return "WAIT_MEM"
-        if request_id in self._settled:
-            return "SKIP"
-        if request_id in self._futures:
-            return "OK"  # idempotent: already in-flight
-        if self._executor is None:
-            return "SKIP"
-        self._futures[request_id] = self._executor.submit(self._prefetch_payload, request_id, sender_info, self._device)
-        return "OK"
-
-    def _prefetch_payload(
-        self,
-        request_id: str,
-        sender_info: dict[str, Any] | None,
-        target_device: torch.device | None,
-    ) -> tuple[dict[str, Any] | None, int]:
-        """Bg-thread body: get + deserialize + H2D on the dedicated bg stream.
-
-        The trailing ``synchronize()`` guarantees the bg-stream copy has
-        finished before the future returns, so the consuming main thread can
-        read the tensors directly after ``fut.result()`` without an explicit
-        event. Raises on failure (payload may be consumed → no sync retry).
-        """
-        mgr = self._manager
-        if mgr is None:
-            return None, 0
-        try:
-            on_device = target_device is not None and target_device.type != "cpu"
-            if on_device:
-                # bg thread doesn't inherit the main thread's current device.
-                torch.accelerator.set_device_index(target_device.index)
-                if self._bg_copy_stream is None:
-                    assert self._executor is not None and self._executor._max_workers == 1
-                    self._bg_copy_stream = current_omni_platform.Stream()
-                with current_omni_platform.stream(self._bg_copy_stream):
-                    data, size = mgr.receive_kv_cache_for_request(
-                        request_id, target_device=target_device, sender_info=sender_info
-                    )
-                    # Ensure bg-stream copies complete before the future returns,
-                    # so consume's fut.result() yields ready-to-read tensors.
-                    self._bg_copy_stream.synchronize()
-            else:
-                data, size = mgr.receive_kv_cache_for_request(
-                    request_id, target_device=target_device, sender_info=sender_info
-                )
-        except Exception:
-            logger.exception("KV prefetch payload failed for %s (payload may be lost)", request_id)
-            raise
-
-        if data is None:
-            return None, 0
-        return data, size
-
-    def _loop(self) -> None:
-        while not self._closed:
-            self._wakeup.wait(timeout=1.0)
-            self._wakeup.clear()
-            self._gc(time.monotonic())
-            while True:
-                with self._lock:
-                    if not self._queue:
-                        break
-                    # Peek the FIFO head (oldest entry).
-                    request_id, sender_info = next(iter(self._queue.items()))
-                    status = self._submit_locked(request_id, sender_info)
-                    if status == "OK":
-                        self._queue.pop(request_id, None)
-                    elif status == "SKIP":
-                        self._queue.pop(request_id, None)
-                    # WAIT_MEM: keep the head and retry next cycle.
-                    if status == "WAIT_MEM":
-                        logger.debug(
-                            "PrefetchManager: pausing — device free mem below %.2f",
-                            self._manager._prefetch_min_free_mem_ratio,
-                        )
-                        break
-
-    def _gc(self, now: float) -> None:
-        """Drop expired _settled entries (abort out-of-order rids that never
-        saw a late kv_prefetch, or whose forget was missed)."""
-        with self._lock:
-            expired = [rid for rid, t in self._settled.items() if now - t > self._SETTLED_TTL_S]
-            for rid in expired:
-                self._settled.pop(rid, None)
-
-
 class OmniKVTransferManager:
     """Unified management for OmniConnector and KV cache transfer.
 
@@ -616,6 +348,8 @@ class OmniKVTransferManager:
     - KV cache transfer with retry logic
     - KV cache receiving with timeout
     """
+
+    _SETTLED_TTL_S = 60.0
 
     def __init__(self, config: OmniKVCacheConfig, *, async_prefetch: bool = False):
         self.config = config
@@ -666,9 +400,12 @@ class OmniKVTransferManager:
         # Prefetch
         self._async_prefetch = async_prefetch
         self._prefetch_min_free_mem_ratio: float = max(0.0, config.kv_prefetch_min_free_mem_ratio)
-        # PrefetchManager owns the queue/futures/executor/bg-stream; lazily
-        # created via init_prefetch_queue().
-        self._prefetch_manager: PrefetchManager | None = None
+        self._prefetch_executor: ThreadPoolExecutor | None = None
+        self._prefetch_futures: dict[str, Any] = {}
+        self._bg_copy_stream: current_omni_platform.Stream | None = None
+        self._prefetch_settled: dict[str, float] | None = None
+        self._prefetch_lock: threading.Lock | None = None
+        self._prefetch_target_device: torch.device | None = None
 
         self._topo_config: _TransferTopoConfig | None = None
 
@@ -691,7 +428,7 @@ class OmniKVTransferManager:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> OmniKVTransferManager:
+    def _create(cls, cfg: dict | None, *, async_prefetch: bool = False) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
             return cls(OmniKVCacheConfig(), async_prefetch=async_prefetch)
@@ -736,7 +473,7 @@ class OmniKVTransferManager:
         return not (has_companion or cls._receiver_pool_on_device(omni_kv))
 
     @classmethod
-    def from_od_config(cls, config: Any) -> OmniKVTransferManager:
+    def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
         """Create from model or OmniDiffusion config."""
         omni_kv = getattr(config, "omni_kv_config", None)
         has_companion = getattr(config, "cfg_kv_collect_func", None) is not None
@@ -746,7 +483,7 @@ class OmniKVTransferManager:
     from_model_config = from_od_config
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> OmniKVTransferManager:
+    def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> "OmniKVTransferManager":
         """Create from vllm config with fallback to kv_transfer_config."""
         # Primary: omni_kv_config on model_config — same shape as from_od_config.
         if isinstance(getattr(model_config, "omni_kv_config", None), dict):
@@ -1393,7 +1130,7 @@ class OmniKVTransferManager:
         from_stage: str,
         to_stage: str,
         put_key: str,
-        data: dict[str, Any] | bytes | torch.Tensor,
+        data: "dict[str, Any] | bytes | torch.Tensor",
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Transfer data with retry and exponential backoff.
@@ -1458,51 +1195,147 @@ class OmniKVTransferManager:
                 logger.exception("Failed to release KV pool buffer")
         buffers.clear()
 
+    def init_prefetch(self, target_device: torch.device | None = None) -> None:
+        """Initialise step-mode prefetch state (call once during runner init)."""
+        if not self._async_prefetch or self._prefetch_lock is not None:
+            return
+        self._prefetch_settled = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_target_device = target_device
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch")
+        logger.info("KV prefetch initialised (target_device=%s)", target_device)
+
+    def _prefetch_discard_future(self, request_id: str) -> None:
+        """Cancel an unstarted prefetch future. Caller holds _prefetch_lock."""
+        fut = self._prefetch_futures.pop(request_id, None)
+        if fut is not None:
+            fut.cancel()
+
+    def _prefetch_remove(self, request_id: str) -> bool:
+        """Physically drop a prefetch future. Caller holds _prefetch_lock.
+
+        Returns True if the rid was present.
+        """
+        had_future = request_id in self._prefetch_futures
+        self._prefetch_discard_future(request_id)
+        return had_future
+
+    def prefetch_submit(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
+        """Submit a background KV prefetch. Safe to call from any thread; idempotent."""
+        if not self._async_prefetch:
+            return
+        if not kv_sender_info or self.topo_config.is_follower:
+            return
+        if self._prefetch_lock is None or self._prefetch_executor is None:
+            logger.error("Prefetch submit called but executor not initialised for %s", request_id)
+            return
+        with self._prefetch_lock:
+            if self._prefetch_settled is not None and request_id in self._prefetch_settled:
+                return
+            if request_id in self._prefetch_futures:
+                return
+            self._prefetch_futures[request_id] = self._prefetch_executor.submit(
+                self._prefetch_payload, request_id, kv_sender_info, self._prefetch_target_device
+            )
+
+    def _prefetch_payload(
+        self,
+        request_id: str,
+        sender_info: dict[str, Any] | None,
+        target_device: torch.device | None,
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Bg-thread body: get + deserialize + H2D on the dedicated ``_bg_copy_stream``.
+
+        Raises on failure (payload may be consumed → no sync retry).
+        """
+        if not self._has_enough_prefetch_device_mem(target_device):
+            logger.info("Prefetch skipped — device free mem below %.2f", self._prefetch_min_free_mem_ratio)
+
+        try:
+            on_device = target_device is not None and target_device.type != "cpu"
+            if on_device:
+                # bg thread doesn't inherit the main thread's current device.
+                torch.accelerator.set_device_index(target_device.index)
+                if self._bg_copy_stream is None:
+                    assert self._prefetch_executor is not None and self._prefetch_executor._max_workers == 1
+                    self._bg_copy_stream = current_omni_platform.Stream()
+                with current_omni_platform.stream(self._bg_copy_stream):
+                    data, size = self.receive_kv_cache_for_request(
+                        request_id, target_device=target_device, sender_info=sender_info
+                    )
+                    self._bg_copy_stream.synchronize()
+            else:
+                data, size = self.receive_kv_cache_for_request(
+                    request_id, target_device=target_device, sender_info=sender_info
+                )
+        except Exception:
+            logger.exception("KV prefetch payload failed for %s (payload may be lost)", request_id)
+            raise
+
+        if data is None:
+            return None, 0
+        return data, size
+
     def consume_prefetched_kv(self, req: Any) -> tuple[dict[str, Any] | None, int]:
         """Consume a prefetched KV payload; (None, 0) on miss/recoverable failure.
 
         Raises ``KVPrefetchConsumeError`` when consumed but post-get failed (no fallback).
-        Delegates to PrefetchManager.consume.
         """
         request_id = self._resolve_request_id(req)
-        if not request_id or self._prefetch_manager is None:
+        if not request_id or not self._async_prefetch or self._prefetch_lock is None:
             return None, 0
-        return self._prefetch_manager.consume(request_id)
+
+        with self._prefetch_lock:
+            fut = self._prefetch_futures.pop(request_id, None)
+        self._prefetch_gc(time.monotonic())
+        if fut is None:
+            return None, 0
+
+        try:
+            return fut.result()
+        except KVPrefetchConsumeError:
+            logger.exception("KV load failed for %s (payload consumed, cannot retry)", request_id)
+            raise
+        except Exception:
+            logger.exception("KV load failed for %s; falling back to sync receive", request_id)
+            return None, 0
 
     def abort_prefetch(self, request_id: str) -> None:
         """Abort prefetch for *request_id* (control-channel kv_prefetch_cancel)."""
-        if self._prefetch_manager is not None:
-            self._prefetch_manager.abort(request_id)
-
-    def forget_prefetch(self, request_id: str) -> None:
-        """Cleanup prefetch state on normal request finish (defensive)."""
-        if self._prefetch_manager is not None:
-            self._prefetch_manager.forget(request_id)
+        if not self._async_prefetch or self._prefetch_lock is None:
+            return
+        self._prefetch_gc(time.monotonic())
+        with self._prefetch_lock:
+            existed = self._prefetch_remove(request_id)
+            if not existed and self._prefetch_settled is not None:
+                self._prefetch_settled[request_id] = time.monotonic()
 
     def shutdown_prefetch(self) -> None:
-        """Teardown: stop the manager (loop/executor) and drop the reference."""
-        if self._prefetch_manager is not None:
-            self._prefetch_manager.close()
-            self._prefetch_manager = None
-
-    def init_prefetch_queue(self, target_device: torch.device | None = None) -> None:
-        """Create the PrefetchManager (call once during runner initialisation)."""
-        if not self._async_prefetch or self._prefetch_manager is not None:
+        """Teardown: cancel futures, shut the executor."""
+        if not self._async_prefetch or self._prefetch_executor is None:
             return
-        self._prefetch_manager = PrefetchManager(self, target_device=target_device)
-        logger.info("KV PrefetchManager initialised (target_device=%s)", target_device)
+        with self._prefetch_lock:
+            for rid in list(self._prefetch_futures):
+                self._prefetch_discard_future(rid)
+            self._prefetch_futures.clear()
+            if self._prefetch_settled is not None:
+                self._prefetch_settled.clear()
+            self._prefetch_settled = None
+        if self._prefetch_executor is not None:
+            try:
+                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                logger.exception("Failed to shut down KV prefetch executor")
+            self._prefetch_executor = None
 
-    def enqueue_prefetch(self, request_id: str, kv_sender_info: dict[str, Any]) -> None:
-        """Enqueue a request for background KV prefetch.
-
-        Called by the model runner when it receives a fire-and-forget
-        ``prefetch`` message (via the lightweight control channel) from the
-        engine.  Safe to call from any thread; idempotent.
-        """
-        if self._prefetch_manager is None:
-            logger.debug("PrefetchManager not initialised — skipping enqueue for %s", request_id)
+    def _prefetch_gc(self, now: float) -> None:
+        """Drop expired _settled entries."""
+        if self._prefetch_settled is None or self._prefetch_lock is None:
             return
-        self._prefetch_manager.enqueue(request_id, kv_sender_info)
+        with self._prefetch_lock:
+            expired = [rid for rid, t in self._prefetch_settled.items() if now - t > self._SETTLED_TTL_S]
+            for rid in expired:
+                self._prefetch_settled.pop(rid, None)
 
     @staticmethod
     def _record_stream_for_prefetched(data: dict[str, Any]) -> None:
