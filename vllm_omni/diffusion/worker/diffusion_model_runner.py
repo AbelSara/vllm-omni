@@ -410,6 +410,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Step-before update: cleanup finished requests and get/create one running state."""
         for request_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(request_id, None)
+            if self._kv_prefetch_enabled:
+                self.kv_transfer_manager.abort_prefetch(request_id)
 
         resolved: list[DiffusionRequestState] = []
         new_request_ids: list[str] = []

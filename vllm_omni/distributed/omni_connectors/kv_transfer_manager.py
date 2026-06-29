@@ -405,6 +405,7 @@ class OmniKVTransferManager:
         self._bg_copy_stream: current_omni_platform.Stream | None = None
         self._prefetch_settled: dict[str, float] | None = None
         self._prefetch_lock: threading.Lock | None = None
+        self._prefetch_inited = False
         self._prefetch_target_device: torch.device | None = None
 
         self._topo_config: _TransferTopoConfig | None = None
@@ -1197,10 +1198,11 @@ class OmniKVTransferManager:
 
     def init_prefetch(self, target_device: torch.device | None = None) -> None:
         """Initialise step-mode prefetch state (call once during runner init)."""
-        if not self._async_prefetch or self._prefetch_lock is not None:
+        if not self._async_prefetch or self._prefetch_inited:
             return
         self._prefetch_settled = {}
         self._prefetch_lock = threading.Lock()
+        self._prefetch_inited = True
         self._prefetch_target_device = target_device
         self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv-prefetch")
         logger.info("KV prefetch initialised (target_device=%s)", target_device)
@@ -1226,10 +1228,12 @@ class OmniKVTransferManager:
             return
         if not kv_sender_info or self.topo_config.is_follower:
             return
-        if self._prefetch_lock is None or self._prefetch_executor is None:
-            logger.error("Prefetch submit called but executor not initialised for %s", request_id)
+        if self._prefetch_lock is None:
             return
         with self._prefetch_lock:
+            if not self._prefetch_inited or self._prefetch_executor is None:
+                logger.error("Prefetch submit called but executor not initialised for %s", request_id)
+                return
             if self._prefetch_settled is not None and request_id in self._prefetch_settled:
                 return
             if request_id in self._prefetch_futures:
@@ -1287,6 +1291,8 @@ class OmniKVTransferManager:
             return None, 0
 
         with self._prefetch_lock:
+            if not self._prefetch_inited:
+                return None, 0
             fut = self._prefetch_futures.pop(request_id, None)
         self._prefetch_gc(time.monotonic())
         if fut is None:
@@ -1307,28 +1313,31 @@ class OmniKVTransferManager:
             return
         self._prefetch_gc(time.monotonic())
         with self._prefetch_lock:
+            if not self._prefetch_inited:
+                return
             existed = self._prefetch_remove(request_id)
             if not existed and self._prefetch_settled is not None:
                 self._prefetch_settled[request_id] = time.monotonic()
 
     def shutdown_prefetch(self) -> None:
-        """Teardown: cancel futures, shut the executor."""
-        if not self._async_prefetch or self._prefetch_executor is None:
+        """Teardown: cancel futures, shut the executor. Idempotent."""
+        if not self._async_prefetch or self._prefetch_lock is None:
             return
         with self._prefetch_lock:
+            self._prefetch_inited = False
             for rid in list(self._prefetch_futures):
                 self._prefetch_discard_future(rid)
             self._prefetch_futures.clear()
             if self._prefetch_settled is not None:
                 self._prefetch_settled.clear()
             self._prefetch_settled = None
-        if self._prefetch_executor is not None:
+        executor = self._prefetch_executor
+        self._prefetch_executor = None
+        if executor is not None:
             try:
-                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+                executor.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 logger.exception("Failed to shut down KV prefetch executor")
-            self._prefetch_executor = None
-        self._prefetch_lock = None
 
     def _prefetch_gc(self, now: float) -> None:
         """Drop expired _settled entries."""
