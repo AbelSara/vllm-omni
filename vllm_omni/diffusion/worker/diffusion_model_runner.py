@@ -503,103 +503,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             not track. For non-HSDP inference, we use torch.inference_mode() for better
             performance.
         """
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if len(req.prompt) == 0:
-            raise ValueError("Cannot execute model with empty request list")
-
-        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
-        use_hsdp = self.od_config.parallel_config.use_hsdp
-        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
-        with grad_context:
-            # Receive AR KV (fetch → distribute → apply inside the entry). prefetch on:
-            # consume prior-forward payload, sync-fallback on miss; else sync receive.
-            kv_recv_t0 = time.perf_counter()
-            if self._kv_prefetch_enabled:
-                self.kv_transfer_manager.consume_and_distribute_kv_cache(
-                    req,
-                    target_device=self.target_device,
-                )
-            else:
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self.target_device,
-                )
-            kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
-            logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
-
-            # Kick off the next request's prefetch (+ H2D) to overlap this forward.
-            if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
-                self.kv_transfer_manager.start_prefetch(kv_prefetch_jobs, self.target_device)
-
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-
-            # Refresh cache context if needed
-            if (
-                not getattr(req, "skip_cache_refresh", False)
-                and self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-            ):
-                # FIXME (Alex): When num_inference_steps is None, we defer to
-                # pipelines for default, but don't refresh the cache; the right
-                # way to do this is to merge the sampling params first.
-                #
-                # For now, if num_inference_steps is not set, we pass 0 to allow
-                # TeaCache to refresh to align with the param signature. This is
-                # okay to force refresh TeaCache because the refresh does not use
-                # num_inference_steps at all (i.e., just resets state and clears
-                # stale residuals).
-                num_inference_steps = req.sampling_params.num_inference_steps
-                if num_inference_steps is None and self.od_config.cache_backend in (
-                    "tea_cache",
-                    "step_cache",
-                ):
-                    # TeaCache refresh ignores the value; step_cache refresh is a
-                    # no-op (per-chunk state resets in the denoise loop). DreamZero often
-                    # leaves sampling_params.num_inference_steps unset and uses the
-                    # pipeline default instead.
-                    num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
-
-                if num_inference_steps is not None:
-                    self.cache_backend.refresh(self.pipeline, num_inference_steps)
-                else:
-                    logger.warning(
-                        "Failed to refresh the diffusion transformer cache; backend %s "
-                        "currently requires num_inference_steps to be passed explicitly",
-                        self.od_config.cache_backend,
-                    )
-
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
-                current_omni_platform.reset_peak_memory_stats()
-
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(DiffusionRequestBatch(requests=[req]))
-
-            if is_primary:
-                output.peak_memory_mb = max(output.peak_memory_mb, self._sample_peak_memory_mb())
-
-            # Log prompt-embed cache activity (hits/misses accumulate across requests).
-            if is_primary and self.prompt_embed_cache is not None:
-                logger.debug("prompt-embed cache: %s", self.prompt_embed_cache.stats())
-
-            # NOTE:
-            if (
-                self.cache_backend is not None
-                and self.cache_backend.is_enabled()
-                and self.od_config.cache_backend == "cache_dit"
-                and self.od_config.enable_cache_dit_summary
-            ):
-                cache_summary(self.pipeline, details=True)
-            return output
+        runner_output = self._execute_request_list(
+            [req],
+            od_config=self.od_config,
+            allow_single_output=True,
+            require_request_batch_support=False,
+            kv_prefetch_jobs=kv_prefetch_jobs,
+            record_name="pipeline_forward",
+        )
+        output = runner_output.runner_outputs[0].result
+        assert output is not None
+        return output
 
     def execute_model_batch(
         self,
