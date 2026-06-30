@@ -511,27 +511,9 @@ def test_split_diffusion_output_by_request_slices_tuple_outputs():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_execute_model_raises_when_required_kv_not_received():
-    """A stage that needs KV must fail loudly when the receive returns falsy,
-    instead of silently running the forward without KV cache."""
+def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
+    """execute_model runs the pipeline forward after the KV receive step."""
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
-    runner.kv_transfer_manager.config.need_recv_cache = True
-    runner.kv_transfer_manager.receive_multi_kv_cache_distributed = lambda *a, **k: False
-    req = _make_request(skip_cache_refresh=True)
-
-    with pytest.raises(RuntimeError, match="KV cache receive failed"):
-        DiffusionModelRunner.execute_model(runner, req)
-
-    # The forward must not run when the required KV is missing.
-    assert runner.pipeline.forward_calls == 0
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_execute_model_proceeds_when_required_kv_received(monkeypatch):
-    """When the required KV is received, execute_model runs normally."""
-    runner = _make_runner(cache_backend=None, cache_backend_name=None)
-    runner.kv_transfer_manager.config.need_recv_cache = True
     runner.kv_transfer_manager.receive_multi_kv_cache_distributed = lambda *a, **k: True
     req = _make_request(skip_cache_refresh=True)
 

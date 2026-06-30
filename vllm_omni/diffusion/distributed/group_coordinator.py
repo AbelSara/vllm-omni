@@ -589,11 +589,12 @@ class GroupCoordinator:
         if dst is None:
             dst = self.group_next_rank
 
-        torch.distributed.send(
-            tensor,
-            self.ranks[dst],
-            group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
-        )
+        device_groups = getattr(self, "device_groups", None)
+        if self.world_size == 2 and device_groups:
+            group = device_groups[self.rank_in_group % 2]
+        else:
+            group = self.device_group
+        torch.distributed.send(tensor, self.ranks[dst], group=group)
 
     def recv(self, size: torch.Size, dtype: torch.dtype, src: int | None = None) -> torch.Tensor:
         """Receives a tensor from the src rank."""
@@ -602,11 +603,12 @@ class GroupCoordinator:
             src = self.group_prev_rank
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(
-            tensor,
-            self.ranks[src],
-            (self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group),
-        )
+        device_groups = getattr(self, "device_groups", None)
+        if self.world_size == 2 and device_groups:
+            group = device_groups[(self.rank_in_group + 1) % 2]
+        else:
+            group = self.device_group
+        torch.distributed.recv(tensor, self.ranks[src], group)
         return tensor
 
     def destroy(self):

@@ -504,7 +504,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             performance.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if len(req.prompts) == 0:
+        if len(req.prompt) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
@@ -515,23 +515,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             # consume prior-forward payload, sync-fallback on miss; else sync receive.
             kv_recv_t0 = time.perf_counter()
             if self._kv_prefetch_enabled:
-                kv_received = self.kv_transfer_manager.consume_and_distribute_kv_cache(
+                self.kv_transfer_manager.consume_and_distribute_kv_cache(
                     req,
                     target_device=self.target_device,
                 )
             else:
-                kv_received = self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                     target_device=self.target_device,
                 )
             kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
             logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
-
-            if self.kv_transfer_manager.config.need_recv_cache and not kv_received:
-                raise RuntimeError(
-                    f"KV cache receive failed for request {req.request_id}, but the stage requires KV transfer"
-                )
 
             # Kick off the next request's prefetch (+ H2D) to overlap this forward.
             if self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
@@ -587,10 +582,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                    output = self.pipeline.forward(DiffusionRequestBatch(requests=[req]))
 
             if is_primary:
-                self._record_peak_memory(output)
+                output.peak_memory_mb = max(output.peak_memory_mb, self._sample_peak_memory_mb())
 
             # Log prompt-embed cache activity (hits/misses accumulate across requests).
             if is_primary and self.prompt_embed_cache is not None:

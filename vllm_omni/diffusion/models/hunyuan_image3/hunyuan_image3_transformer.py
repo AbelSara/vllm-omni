@@ -1099,7 +1099,7 @@ class ImageKVCacheManager:
 
         neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
         self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
-        logger.info(
+        logger.debug(
             "[AR KV Reuse] neg branch: reused shared_prefix_len=%d, neg_kv_total_len=%d (q_len_actual=%d)",
             shared_prefix_len,
             key.shape[1],
