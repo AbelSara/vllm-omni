@@ -350,7 +350,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_recv_t0 = time.perf_counter()
         self.receive_kv_cache(req)
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
-        logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
+        logger.info("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             if req.sampling_params.generator_device is not None:
@@ -360,14 +360,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             else:
                 gen_device = self.device
             req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-                if req.sampling_params.generator_device is not None:
-                    gen_device = req.sampling_params.generator_device
-                elif self.device.type == "cpu":
-                    gen_device = "cpu"
-                else:
-                    gen_device = self.device
-                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
     def _refresh_cache_for_requests(
         self,
