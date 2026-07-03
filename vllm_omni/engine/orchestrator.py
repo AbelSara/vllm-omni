@@ -1288,7 +1288,6 @@ class Orchestrator:
                         )
                         return
                     if len(diffusion_prompt) == 1:
-                        # Unwrap on initial submit too; diffusion rejects list-prompts.
                         diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
