@@ -63,9 +63,7 @@
                                     "max_tokens": 8192,
                                     "detokenize": true,
                                     "skip_special_tokens": false,
-                                    "stop_token_ids": [
-                                        128025
-                                    ]
+                                    "include_stop_str_in_output": true
                                 }
                             },
                             {
