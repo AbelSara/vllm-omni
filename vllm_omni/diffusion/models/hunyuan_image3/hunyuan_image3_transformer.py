@@ -2235,9 +2235,8 @@ class HunyuanImage3Model(nn.Module):
             # processed with quantization, LoRA, fine-tuning, etc.
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            # KV-cache scales (.output_scale) are renamed to .attn.{k,v,q}_scale
-            # by the quant_config's get_cache_scale_mapper via the outer
-            # AutoWeightsLoader before reaching here; no manual handling needed.
+            # KV-cache scales are renamed via maybe_remap_kv_scale_name below;
+            # quant_config.get_cache_scale was removed in vLLM v0.23.0 (see #4810).
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
