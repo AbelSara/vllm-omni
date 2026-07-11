@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    mapped_piecewise_attn,
     piecewise_attn,
 )
 
@@ -207,6 +208,17 @@ class FlashAttentionHubImpl(AttentionImpl):
                 attn_func=self.flash_attn_func,
             )
 
+            if attn_metadata.query_ranges is not None:
+                return mapped_piecewise_attn(
+                    query,
+                    key,
+                    value,
+                    full_attn_spans,
+                    attn_metadata.query_ranges,
+                    self.softmax_scale,
+                    attn_func,
+                )
+
             return piecewise_attn(
                 query,
                 key,
@@ -371,6 +383,17 @@ class FlashAttention3HubImpl(AttentionImpl):
                 self._flash_wrapper,
                 attn_func=self.flash_attn_func,
             )
+
+            if attn_metadata.query_ranges is not None:
+                return mapped_piecewise_attn(
+                    query,
+                    key,
+                    value,
+                    full_attn_spans,
+                    attn_metadata.query_ranges,
+                    self.softmax_scale,
+                    attn_func,
+                )
 
             return piecewise_attn(
                 query,
