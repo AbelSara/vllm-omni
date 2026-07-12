@@ -7,10 +7,13 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import os
+import time
 from dataclasses import replace
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
@@ -26,6 +29,61 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _current_dist_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _shape_str(tensor: torch.Tensor) -> str:
+    return "x".join(str(x) for x in tensor.shape)
+
+
+def _sp_debug_str() -> str:
+    if not is_forward_context_available():
+        return "sp_cfg=NA sp_group=NA"
+
+    fwd_ctx = get_forward_context()
+    parallel_config = getattr(fwd_ctx.omni_diffusion_config, "parallel_config", None)
+    cfg_sp = getattr(parallel_config, "sequence_parallel_size", "NA")
+    cfg_ulysses = getattr(parallel_config, "ulysses_degree", "NA")
+    cfg_ring = getattr(parallel_config, "ring_degree", "NA")
+    cfg_allgather = getattr(parallel_config, "allgather_degree", "NA")
+
+    try:
+        sp_group = get_sp_group()
+        group_info = (
+            f"world={sp_group.world_size},rank={sp_group.rank_in_group},"
+            f"ulysses_world={sp_group.ulysses_world_size},ulysses_rank={sp_group.ulysses_rank},"
+            f"ring_world={sp_group.ring_world_size},ring_rank={sp_group.ring_rank}"
+        )
+    except Exception as e:
+        group_info = f"unavailable:{type(e).__name__}"
+
+    return (
+        f"sp_cfg=seq:{cfg_sp},ulysses:{cfg_ulysses},ring:{cfg_ring},allgather:{cfg_allgather} "
+        f"sp_group={group_info}"
+    )
+
+
+def _sync_for_profile(tensor: torch.Tensor) -> None:
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+    elif current_omni_platform.is_available():
+        current_omni_platform.synchronize()
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -146,6 +204,7 @@ class Attention(nn.Module):
         self._no_parallel_strategy = NoParallelAttention()
 
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
+        self._sp_profile_call_count = 0
 
         self._kv_cache_dtype: str | None = None
         self._kv_cache_skip_steps: set[int] | None = None
@@ -262,11 +321,22 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
+        profile_sp = self._should_profile_sp_attention(strategy.name)
+        profile_t0 = profile_t1 = profile_t2 = profile_t3 = 0.0
+        q_in_shape = _shape_str(query)
+        k_in_shape = _shape_str(key)
+        v_in_shape = _shape_str(value)
+        if profile_sp:
+            _sync_for_profile(query)
+            profile_t0 = time.perf_counter()
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+        if profile_sp:
+            _sync_for_profile(query)
+            profile_t1 = time.perf_counter()
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
 
@@ -275,12 +345,104 @@ class Attention(nn.Module):
             out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)
+        if profile_sp:
+            _sync_for_profile(out)
+            profile_t2 = time.perf_counter()
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
         out = strategy.post_attention(out, ctx)
+        if profile_sp:
+            _sync_for_profile(out)
+            profile_t3 = time.perf_counter()
+            self._log_sp_attention_profile(
+                strategy_name=strategy.name,
+                q_in_shape=q_in_shape,
+                k_in_shape=k_in_shape,
+                v_in_shape=v_in_shape,
+                q_work_shape=_shape_str(query),
+                k_work_shape=_shape_str(key),
+                v_work_shape=_shape_str(value),
+                out_shape=_shape_str(out),
+                pre_ms=(profile_t1 - profile_t0) * 1000.0,
+                attn_ms=(profile_t2 - profile_t1) * 1000.0,
+                post_ms=(profile_t3 - profile_t2) * 1000.0,
+                total_ms=(profile_t3 - profile_t0) * 1000.0,
+            )
 
         return out
+
+    def _should_profile_sp_attention(self, strategy_name: str) -> bool:
+        if not _env_flag("DIFFUSION_SP_PROFILE"):
+            return False
+        if strategy_name == "none" and not _env_flag("DIFFUSION_SP_PROFILE_NO_PARALLEL"):
+            return False
+
+        rank_filter = os.environ.get("DIFFUSION_SP_PROFILE_RANK")
+        if rank_filter not in (None, "", "*"):
+            try:
+                if _current_dist_rank() != int(rank_filter):
+                    return False
+            except ValueError:
+                pass
+
+        layer_filter = os.environ.get("DIFFUSION_SP_PROFILE_LAYER")
+        if layer_filter not in (None, "", "*"):
+            try:
+                if self.layer_idx != int(layer_filter):
+                    return False
+            except ValueError:
+                pass
+
+        self._sp_profile_call_count += 1
+        every = max(1, _env_int("DIFFUSION_SP_PROFILE_EVERY", 1))
+        return self._sp_profile_call_count % every == 0
+
+    def _log_sp_attention_profile(
+        self,
+        *,
+        strategy_name: str,
+        q_in_shape: str,
+        k_in_shape: str,
+        v_in_shape: str,
+        q_work_shape: str,
+        k_work_shape: str,
+        v_work_shape: str,
+        out_shape: str,
+        pre_ms: float,
+        attn_ms: float,
+        post_ms: float,
+        total_ms: float,
+    ) -> None:
+        step_idx = None
+        sp_active = None
+        if is_forward_context_available():
+            fwd_ctx = get_forward_context()
+            step_idx = fwd_ctx.denoise_step_idx
+            sp_active = fwd_ctx.sp_active
+
+        logger.info(
+            "[SPAttentionProfiler] strategy=%s rank=%s layer=%s step=%s sp_active=%s "
+            "pre_ms=%.3f attn_ms=%.3f post_ms=%.3f total_ms=%.3f "
+            "q_in=%s k_in=%s v_in=%s q_work=%s k_work=%s v_work=%s out=%s %s",
+            strategy_name,
+            _current_dist_rank(),
+            self.layer_idx,
+            step_idx,
+            sp_active,
+            pre_ms,
+            attn_ms,
+            post_ms,
+            total_ms,
+            q_in_shape,
+            k_in_shape,
+            v_in_shape,
+            q_work_shape,
+            k_work_shape,
+            v_work_shape,
+            out_shape,
+            _sp_debug_str(),
+        )
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:
@@ -301,3 +463,4 @@ class Attention(nn.Module):
             )
 
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
+

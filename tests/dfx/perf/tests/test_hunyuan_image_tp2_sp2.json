@@ -4,11 +4,10 @@
         "description": "TP=2 SP=2 baseline",
         "server_type": "vllm-omni",
         "server_params": {
-            "model": "tencent/HunyuanImage-3.0-Instruct",
+            "model": "/root/autodl-tmp/HunyuanImage-3.0-Instruct",
             "serve_args": {
-                "deploy-config": "../vllm_omni/deploy/hunyuan_image3_dit.yaml",
+                "deploy-config": "/root/vllm-omni/vllm_omni/deploy/hunyuan_image3_dit.yaml",
                 "tensor-parallel-size": 2,
-                "ulysses-degree": 2,
                 "enable-diffusion-pipeline-profiler": true
             }
         },
