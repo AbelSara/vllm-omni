@@ -2925,7 +2925,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
-            logger.info(
+            logger.debug(
                 "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
                 cfg_rank,
             )
