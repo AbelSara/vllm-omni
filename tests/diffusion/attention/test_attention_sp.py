@@ -316,6 +316,44 @@ def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     )
 
 
+def test_allgather_kv_query_ranges_include_reused_prefix_offset():
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=1,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    query = torch.zeros((1, 2, 1, 1))
+    key = torch.zeros((1, 2, 1, 1))
+    value = torch.zeros((1, 2, 1, 1))
+    joint_query = torch.ones((1, 1, 1, 1))
+    # K/V retain two reused AR-prefix tokens that have already been removed
+    # from Q and from the attention mask's query rows.
+    joint_key = torch.ones((1, 3, 1, 1))
+    joint_value = torch.ones((1, 3, 1, 1))
+    mask = torch.arange(5 * 7).view(1, 1, 5, 7)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint_query,
+        joint_key=joint_key,
+        joint_value=joint_value,
+        full_attn_spans=[[(0, 7)]],
+    )
+
+    _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert metadata_out is not None
+    assert metadata_out.query_ranges == (
+        QueryRange(0, 1, 2),
+        QueryRange(1, 3, 5),
+    )
+    expected_mask = torch.cat([mask[..., :1, :], mask[..., 3:5, :]], dim=-2)
+    assert torch.equal(metadata_out.attn_mask, expected_mask)
+
+
 def test_allgather_kv_allows_empty_full_attn_spans():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(

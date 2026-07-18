@@ -80,6 +80,15 @@ class AllGatherKVParallelAttention:
         else:
             k_full, v_full = k_img_full, v_img_full
 
+        joint_len = joint_q.shape[1] if joint_q is not None else 0
+        logical_q_full_len = joint_len + k_img_full.shape[1]
+        query_global_offset = k_full.shape[1] - logical_q_full_len
+        if query_global_offset < 0:
+            raise ValueError(
+                "AllGather-KV SP global K length is shorter than the logical Q length: "
+                f"k_len={k_full.shape[1]}, logical_q_len={logical_q_full_len}."
+            )
+
         kv_repeat_num = int(attn_metadata.extra.get("kv_repeat_num", 1)) if attn_metadata is not None else 1
         k_full = repeat_kv(k_full, kv_repeat_num)
         v_full = repeat_kv(v_full, kv_repeat_num)
@@ -97,8 +106,9 @@ class AllGatherKVParallelAttention:
             q_local_len=q_local.shape[1],
             img_seq_local=query.shape[1],
             img_seq_full=k_img_full.shape[1],
-            joint_len=joint_q.shape[1] if joint_q is not None else 0,
+            joint_len=joint_len,
             joint_strategy=joint_strategy,
+            query_global_offset=query_global_offset,
         )
 
         return q_local, k_full, v_full, attn_metadata, _AllGatherKVCtx(name=self.name)
@@ -112,6 +122,7 @@ class AllGatherKVParallelAttention:
         img_seq_full: int,
         joint_len: int,
         joint_strategy: str,
+        query_global_offset: int,
     ) -> AttentionMetadata | None:
         """Slice global query metadata for the local query shard."""
         if attn_metadata is None:
@@ -127,13 +138,13 @@ class AllGatherKVParallelAttention:
 
         if joint_strategy == "front":
             ranges = (
-                *((QueryRange(0, joint_len, 0),) if joint_len else ()),
-                QueryRange(joint_len, q_local_len, joint_len + img_start),
+                *((QueryRange(0, joint_len, query_global_offset),) if joint_len else ()),
+                QueryRange(joint_len, q_local_len, query_global_offset + joint_len + img_start),
             )
         else:
             ranges = (
-                QueryRange(0, img_seq_local, img_start),
-                *((QueryRange(img_seq_local, q_local_len, img_seq_full),) if joint_len else ()),
+                QueryRange(0, img_seq_local, query_global_offset + img_start),
+                *((QueryRange(img_seq_local, q_local_len, query_global_offset + img_seq_full),) if joint_len else ()),
             )
 
         if attn_metadata.attn_mask is None:
@@ -154,7 +165,11 @@ class AllGatherKVParallelAttention:
                     f"(joint_len={joint_len}, img_seq_local={img_seq_local}, img_seq_full={img_seq_full})."
                 )
 
-            parts = [mask[..., r.global_start : r.global_start + (r.local_end - r.local_start), :] for r in ranges]
+            parts = [
+                mask[..., local_start : local_start + (r.local_end - r.local_start), :]
+                for r in ranges
+                for local_start in (r.global_start - query_global_offset,)
+            ]
             local_mask = torch.cat(parts, dim=-2)
 
         if local_mask.shape[-2] != q_local_len:
