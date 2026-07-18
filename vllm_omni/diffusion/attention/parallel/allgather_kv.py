@@ -154,16 +154,8 @@ class AllGatherKVParallelAttention:
                     f"(joint_len={joint_len}, img_seq_local={img_seq_local}, img_seq_full={img_seq_full})."
                 )
 
-            if joint_len > 0 and joint_strategy == "front":
-                joint_mask = mask[..., :joint_len, :]
-                img_mask = mask[..., joint_len + img_start : joint_len + img_end, :]
-                local_mask = torch.cat([joint_mask, img_mask], dim=-2)
-            elif joint_len > 0:
-                img_mask = mask[..., img_start:img_end, :]
-                joint_mask = mask[..., img_seq_full : img_seq_full + joint_len, :]
-                local_mask = torch.cat([img_mask, joint_mask], dim=-2)
-            else:
-                local_mask = mask[..., img_start:img_end, :]
+            parts = [mask[..., r.global_start : r.global_start + (r.local_end - r.local_start), :] for r in ranges]
+            local_mask = torch.cat(parts, dim=-2)
 
         if local_mask.shape[-2] != q_local_len:
             raise ValueError(

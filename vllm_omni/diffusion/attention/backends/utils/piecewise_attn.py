@@ -9,7 +9,8 @@ follows FlashAttention's bottom-right convention (``K[:e]`` is attended by
 
 Per segment:
   - causal segment ``[s, e)``: ``attn(Q[:, s:e], K[:, :e], V[:, :e], causal=True)``
-  - full-attn span ``[a, e)``: ``attn(Q[:, a:e], K[:, :e], V[:, :e], causal=False)``
+  - full-attn span ``[a, b)`` intersecting the query range at ``[s, e)``:
+    ``attn(Q[:, s:e], K[:, :b], V[:, :b], causal=False)``
 """
 
 from __future__ import annotations
@@ -23,12 +24,6 @@ if TYPE_CHECKING:
 
 
 class Segment(NamedTuple):
-    start: int
-    end: int
-    mode: Literal["causal", "full"]
-
-
-class MappedSegment(NamedTuple):
     q_start: int
     q_end: int
     kv_end: int
@@ -42,49 +37,32 @@ def build_segments(full_attn_spans, query_offset, query_len):
     query_len: length of the query
 
     return:
-        List[Segment] in global coordinates, clipped to [query_offset, query_offset + query_len)
+        List[Segment] in global coordinates, clipped to
+        [query_offset, query_offset + query_len). Full-attention segments retain
+        the original span end as kv_end so a local query shard can attend past
+        its own boundary.
     """
     q_start = query_offset
     q_end = query_offset + query_len
 
-    segs: list[Segment] = []
+    segments: list[Segment] = []
     cur = q_start
 
-    for a, e in full_attn_spans:
-        # clip span to query range
-        a_clipped = max(a, q_start)
-        e_clipped = min(e, q_end)
-        if a_clipped >= e_clipped:
-            continue
-
-        if cur < a_clipped:
-            segs.append(Segment(cur, a_clipped, "causal"))
-        segs.append(Segment(a_clipped, e_clipped, "full"))
-        cur = e_clipped
-
-    if cur < q_end:
-        segs.append(Segment(cur, q_end, "causal"))
-
-    return segs
-
-
-def build_mapped_segments(full_attn_spans, query_offset, query_len):
-    q_end = query_offset + query_len
-    segments: list[MappedSegment] = []
-    cur = query_offset
-
     for span_start, span_end in full_attn_spans:
-        overlap_start = max(span_start, query_offset)
+        # clip span to query range
+        overlap_start = max(span_start, q_start)
         overlap_end = min(span_end, q_end)
         if overlap_start >= overlap_end:
             continue
+
         if cur < overlap_start:
-            segments.append(MappedSegment(cur, overlap_start, overlap_start, "causal"))
-        segments.append(MappedSegment(overlap_start, overlap_end, span_end, "full"))
+            segments.append(Segment(cur, overlap_start, overlap_start, "causal"))
+        segments.append(Segment(overlap_start, overlap_end, span_end, "full"))
         cur = overlap_end
 
     if cur < q_end:
-        segments.append(MappedSegment(cur, q_end, q_end, "causal"))
+        segments.append(Segment(cur, q_end, q_end, "causal"))
+
     return segments
 
 
@@ -116,14 +94,14 @@ def piecewise_attn(
     spans = full_attn_spans[0]
     out = query.new_zeros(B, Sq, H, D)
 
-    for s, e, mode in build_segments(spans, query_offset, Sq):
-        q_s = s - query_offset
-        q_e = e - query_offset
+    for segment in build_segments(spans, query_offset, Sq):
+        q_s = segment.q_start - query_offset
+        q_e = segment.q_end - query_offset
         out_seg = attn_func(
             query[:, q_s:q_e],
-            key[:, :e],
-            value[:, :e],
-            causal=(mode == "causal"),
+            key[:, : segment.kv_end],
+            value[:, : segment.kv_end],
+            causal=(segment.mode == "causal"),
             softmax_scale=softmax_scale,
         )
         out[:, q_s:q_e] = out_seg
@@ -148,7 +126,7 @@ def mapped_piecewise_attn(
         query_len = query_range.local_end - query_range.local_start
         if query_range.local_start != covered or query_len < 0:
             raise ValueError("query_ranges must cover local query contiguously")
-        for segment in build_mapped_segments(spans, query_range.global_start, query_len):
+        for segment in build_segments(spans, query_range.global_start, query_len):
             q_start = query_range.local_start + segment.q_start - query_range.global_start
             q_end = query_range.local_start + segment.q_end - query_range.global_start
             out[:, q_start:q_end] = attn_func(

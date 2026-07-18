@@ -21,6 +21,8 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    Segment,
+    build_segments,
     mapped_piecewise_attn,
     piecewise_attn,
 )
@@ -71,6 +73,12 @@ BATCH_CASES = [
     pytest.param(1, id="B1"),
     pytest.param(2, id="B2"),
 ]
+
+
+def test_build_segments_full_span_retains_global_kv_end():
+    segments = build_segments([(2, 7)], query_offset=4, query_len=2)
+
+    assert segments == [Segment(q_start=4, q_end=6, kv_end=7, mode="full")]
 
 
 @pytest.mark.parametrize("global_spans", SPAN_CASES)
