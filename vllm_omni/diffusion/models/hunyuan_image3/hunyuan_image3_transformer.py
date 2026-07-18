@@ -1183,7 +1183,6 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
-                extra={"kv_repeat_num": repeat_num},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)

@@ -301,6 +301,9 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     calls = []
 
     def fake_varlen_func(q, k, v, **kwargs):
+        assert q.shape[1] == 4
+        assert k.shape[1] == 2
+        assert v.shape[1] == 2
         calls.append(kwargs)
         return q
 
@@ -308,8 +311,8 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
 
-    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
-    query = torch.randn(1, 3, 2, 4)
+    impl = FlashAttentionImpl(num_heads=4, num_kv_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 3, 4, 4)
     key = torch.randn(1, 3, 2, 4)
     value = torch.randn(1, 3, 2, 4)
     metadata = AttentionMetadata(full_attn_spans=[[(0, 3)]])
