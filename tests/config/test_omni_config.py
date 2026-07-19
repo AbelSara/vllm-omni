@@ -550,7 +550,7 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_degrees(tmp_pa
     assert stage.parallel_config.world_size == 6
 
 
-def test_from_registry_derives_sequence_parallel_size_from_allgather_degree(tmp_path):
+def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degree(tmp_path):
     deploy_path = tmp_path / "dreamzero_allgather_parallel.yaml"
     deploy_path.write_text(
         "\n".join(
@@ -566,7 +566,7 @@ def test_from_registry_derives_sequence_parallel_size_from_allgather_degree(tmp_
         )
     )
 
-    stage = VllmOmniConfig.from_registry("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.allgather_degree == 2
