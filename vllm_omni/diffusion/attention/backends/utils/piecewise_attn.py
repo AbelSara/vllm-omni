@@ -86,58 +86,40 @@ def piecewise_attn(
     full_attn_spans: list[list[tuple[int, int]]],
     softmax_scale: float,
     attn_func,
-):
-    B, Sq, H, D = query.shape
-    _check_homogeneous(full_attn_spans)
-
-    query_offset = key.shape[1] - Sq
-    spans = full_attn_spans[0]
-    out = query.new_zeros(B, Sq, H, D)
-
-    for segment in build_segments(spans, query_offset, Sq):
-        q_s = segment.q_start - query_offset
-        q_e = segment.q_end - query_offset
-        out_seg = attn_func(
-            query[:, q_s:q_e],
-            key[:, : segment.kv_end],
-            value[:, : segment.kv_end],
-            causal=(segment.mode == "causal"),
-            softmax_scale=softmax_scale,
-        )
-        out[:, q_s:q_e] = out_seg
-    return out
-
-
-def mapped_piecewise_attn(
-    query,
-    key,
-    value,
-    full_attn_spans: list[list[tuple[int, int]]],
-    query_ranges: tuple[QueryRange, ...],
-    softmax_scale: float,
-    attn_func,
+    query_ranges: tuple[QueryRange, ...] | None = None,
 ):
     _check_homogeneous(full_attn_spans)
     spans = full_attn_spans[0]
-    out = torch.empty_like(query)
+    if query_ranges is None:
+        query_len = query.shape[1]
+        ranges = ((0, query_len, key.shape[1] - query_len),)
+    else:
+        ranges = tuple((r.local_start, r.local_end, r.global_start) for r in query_ranges)
+
+    outputs = []
     covered = 0
-
-    for query_range in query_ranges:
-        query_len = query_range.local_end - query_range.local_start
-        if query_range.local_start != covered or query_len < 0:
+    for local_start, local_end, global_start in ranges:
+        query_len = local_end - local_start
+        if local_start != covered or query_len < 0:
             raise ValueError("query_ranges must cover local query contiguously")
-        for segment in build_segments(spans, query_range.global_start, query_len):
-            q_start = query_range.local_start + segment.q_start - query_range.global_start
-            q_end = query_range.local_start + segment.q_end - query_range.global_start
-            out[:, q_start:q_end] = attn_func(
-                query[:, q_start:q_end],
-                key[:, : segment.kv_end],
-                value[:, : segment.kv_end],
-                causal=(segment.mode == "causal"),
-                softmax_scale=softmax_scale,
+        for segment in build_segments(spans, global_start, query_len):
+            q_start = local_start + segment.q_start - global_start
+            q_end = local_start + segment.q_end - global_start
+            outputs.append(
+                attn_func(
+                    query[:, q_start:q_end],
+                    key[:, : segment.kv_end],
+                    value[:, : segment.kv_end],
+                    causal=(segment.mode == "causal"),
+                    softmax_scale=softmax_scale,
+                )
             )
-        covered = query_range.local_end
+        covered = local_end
 
     if covered != query.shape[1]:
         raise ValueError("query_ranges must cover the full local query")
-    return out
+    if not outputs:
+        return torch.empty_like(query)
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=1)

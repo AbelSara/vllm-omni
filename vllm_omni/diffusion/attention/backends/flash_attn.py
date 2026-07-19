@@ -13,7 +13,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
-    mapped_piecewise_attn,
     piecewise_attn,
 )
 
@@ -223,17 +222,6 @@ class FlashAttentionImpl(AttentionImpl):
             else:
                 raise ImportError("Piecewise FlashAttention requires a dense or varlen FlashAttention function")
 
-            if attn_metadata.query_ranges is not None:
-                return mapped_piecewise_attn(
-                    query,
-                    key,
-                    value,
-                    full_attn_spans,
-                    attn_metadata.query_ranges,
-                    self.softmax_scale,
-                    attn_func,
-                )
-
             return piecewise_attn(
                 query,
                 key,
@@ -241,6 +229,7 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):

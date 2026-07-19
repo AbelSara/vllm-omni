@@ -19,11 +19,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm_omni.diffusion.attention.backends.utils.piecewise_attn as piecewise_module
 from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     Segment,
     build_segments,
-    mapped_piecewise_attn,
     piecewise_attn,
 )
 
@@ -136,7 +136,7 @@ def test_piecewise_span_fully_before_qstart():
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_mapped_piecewise_noncontiguous_query_matches_full_mask():
+def test_piecewise_noncontiguous_query_ranges_match_full_mask():
     torch.manual_seed(0)
     B, H, D, Sk = 1, 2, 8, 8
     key = torch.randn(B, Sk, H, D, device=DEVICE)
@@ -149,14 +149,14 @@ def test_mapped_piecewise_noncontiguous_query_matches_full_mask():
     )
     softmax_scale = D**-0.5
 
-    got = mapped_piecewise_attn(
+    got = piecewise_attn(
         query,
         key,
         value,
         full_attn_spans=[spans],
-        query_ranges=query_ranges,
         softmax_scale=softmax_scale,
         attn_func=_sdpa_attn_func,
+        query_ranges=query_ranges,
     )
     expected = torch.cat(
         [
@@ -168,18 +168,46 @@ def test_mapped_piecewise_noncontiguous_query_matches_full_mask():
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_mapped_piecewise_rejects_incomplete_query_ranges():
+def test_piecewise_rejects_incomplete_query_ranges():
     query = torch.zeros(1, 3, 1, 2)
     key = torch.zeros(1, 3, 1, 2)
     value = torch.zeros_like(key)
 
     with pytest.raises(ValueError, match="cover local query contiguously"):
-        mapped_piecewise_attn(
+        piecewise_attn(
             query,
             key,
             value,
             full_attn_spans=[[]],
-            query_ranges=(QueryRange(1, 3, 1),),
             softmax_scale=1.0,
             attn_func=_sdpa_attn_func,
+            query_ranges=(QueryRange(1, 3, 1),),
         )
+
+
+def test_piecewise_combines_noncontiguous_query_ranges_with_one_cat(monkeypatch):
+    query = torch.randn(1, 4, 2, 8)
+    key = torch.randn(1, 8, 2, 8)
+    value = torch.randn_like(key)
+    cat_calls = 0
+    original_cat = torch.cat
+
+    def counted_cat(tensors, dim=0):
+        nonlocal cat_calls
+        cat_calls += 1
+        return original_cat(tensors, dim=dim)
+
+    monkeypatch.setattr(piecewise_module.torch, "cat", counted_cat)
+
+    output = piecewise_attn(
+        query,
+        key,
+        value,
+        full_attn_spans=[[(0, 8)]],
+        softmax_scale=1.0,
+        attn_func=lambda q, k, v, **kwargs: q,
+        query_ranges=(QueryRange(0, 1, 0), QueryRange(1, 4, 4)),
+    )
+
+    assert cat_calls == 1
+    torch.testing.assert_close(output, query)

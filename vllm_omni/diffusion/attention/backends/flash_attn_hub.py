@@ -12,10 +12,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
-    mapped_piecewise_attn,
-    piecewise_attn,
-)
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 
 logger = init_logger(__name__)
 
@@ -208,17 +205,6 @@ class FlashAttentionHubImpl(AttentionImpl):
                 attn_func=self.flash_attn_func,
             )
 
-            if attn_metadata.query_ranges is not None:
-                return mapped_piecewise_attn(
-                    query,
-                    key,
-                    value,
-                    full_attn_spans,
-                    attn_metadata.query_ranges,
-                    self.softmax_scale,
-                    attn_func,
-                )
-
             return piecewise_attn(
                 query,
                 key,
@@ -226,6 +212,7 @@ class FlashAttentionHubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
@@ -384,17 +371,6 @@ class FlashAttention3HubImpl(AttentionImpl):
                 attn_func=self.flash_attn_func,
             )
 
-            if attn_metadata.query_ranges is not None:
-                return mapped_piecewise_attn(
-                    query,
-                    key,
-                    value,
-                    full_attn_spans,
-                    attn_metadata.query_ranges,
-                    self.softmax_scale,
-                    attn_func,
-                )
-
             return piecewise_attn(
                 query,
                 key,
@@ -402,6 +378,7 @@ class FlashAttention3HubImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
