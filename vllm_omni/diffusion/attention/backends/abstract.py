@@ -14,6 +14,7 @@ class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
+    supports_piecewise_spans: bool = False
 
     @classmethod
     def supports_attention_mask(cls) -> bool:

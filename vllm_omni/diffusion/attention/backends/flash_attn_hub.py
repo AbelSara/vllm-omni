@@ -79,6 +79,7 @@ def _run_varlen_dense(
 
 class FlashAttentionHubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -255,6 +256,7 @@ class FlashAttentionHubImpl(AttentionImpl):
 
 class FlashAttention3HubBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
