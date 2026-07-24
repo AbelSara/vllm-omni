@@ -1086,6 +1086,12 @@ class ImageKVCacheManager:
 
         neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
         self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
+        logger.debug(
+            "[AR KV Reuse] neg branch: reused shared_prefix_len=%d, neg_kv_total_len=%d (q_len_actual=%d)",
+            shared_prefix_len,
+            key.shape[1],
+            q_len_actual,
+        )
         return key, value
 
     def __call__(
@@ -1177,7 +1183,6 @@ class ImageKVCacheManager:
                 joint_strategy="front",
                 attn_mask=attention_mask,
                 full_attn_spans=full_attn_spans,
-                extra={"kv_repeat_num": repeat_num},
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2909,6 +2914,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
+            logger.debug(
+                "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
+                cfg_rank,
+            )
             return input_ids, 0
 
         # 1. positive prefix len

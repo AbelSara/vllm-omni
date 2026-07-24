@@ -316,6 +316,44 @@ def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     )
 
 
+def test_allgather_kv_query_ranges_include_reused_prefix_offset():
+    strategy = AllGatherKVParallelAttention(
+        _MockAllGatherSPGroup(
+            rank=1,
+            gather_chunks=[
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+                [torch.zeros((1, 2, 1, 1)), torch.zeros((1, 2, 1, 1))],
+            ],
+        ),
+    )
+    query = torch.zeros((1, 2, 1, 1))
+    key = torch.zeros((1, 2, 1, 1))
+    value = torch.zeros((1, 2, 1, 1))
+    joint_query = torch.ones((1, 1, 1, 1))
+    # K/V retain two reused AR-prefix tokens that have already been removed
+    # from Q and from the attention mask's query rows.
+    joint_key = torch.ones((1, 3, 1, 1))
+    joint_value = torch.ones((1, 3, 1, 1))
+    mask = torch.arange(5 * 7).view(1, 1, 5, 7)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        joint_query=joint_query,
+        joint_key=joint_key,
+        joint_value=joint_value,
+        full_attn_spans=[[(0, 7)]],
+    )
+
+    _, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert metadata_out is not None
+    assert metadata_out.query_ranges == (
+        QueryRange(0, 1, 2),
+        QueryRange(1, 3, 5),
+    )
+    expected_mask = torch.cat([mask[..., :1, :], mask[..., 3:5, :]], dim=-2)
+    assert torch.equal(metadata_out.attn_mask, expected_mask)
+
+
 def test_allgather_kv_allows_empty_full_attn_spans():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -338,7 +376,7 @@ def test_allgather_kv_allows_empty_full_attn_spans():
     assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
 
 
-def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
+def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     rank = 0
     img_seq_local = 2
     kv_heads = 2
@@ -355,17 +393,16 @@ def test_allgather_kv_gathers_compressed_kv_then_repeats_locally():
     strategy = AllGatherKVParallelAttention(sp_group)
 
     query = torch.zeros((1, img_seq_local, q_heads, 1))
-    metadata = AttentionMetadata(extra={"kv_repeat_num": repeat_num})
-    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], metadata)
+    _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], AttentionMetadata())
 
     assert sp_group.gathered_input_shapes == [
         (1, img_seq_local, kv_heads, 1),
         (1, img_seq_local, kv_heads, 1),
     ]
-    assert k_full.shape == (1, img_seq_local * 2, q_heads, 1)
-    assert v_full.shape == (1, img_seq_local * 2, q_heads, 1)
-    expected_key = torch.cat(key_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
-    expected_value = torch.cat(value_chunks, dim=1).repeat_interleave(repeat_num, dim=2)
+    assert k_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    assert v_full.shape == (1, img_seq_local * 2, kv_heads, 1)
+    expected_key = torch.cat(key_chunks, dim=1)
+    expected_value = torch.cat(value_chunks, dim=1)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
 
