@@ -5,7 +5,7 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, cast
 
 import numpy as np
@@ -69,7 +69,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pp_group,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
+    get_sp_group,
 )
+from vllm_omni.diffusion.distributed.shared_weight import SharedAttentionWeightManager
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -2034,7 +2036,7 @@ class HunyuanImage3Model(nn.Module):
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = ""):
+    def __init__(self, config: HunyuanImage3Config, quant_config=None, prefix: str = "", parallel_config=None):
         super().__init__()
         lora_config = None
         self.num_redundant_experts = 0
@@ -2067,6 +2069,28 @@ class HunyuanImage3Model(nn.Module):
             ),
             prefix=f"{prefix}.layers" if prefix else "layers",
         )
+        self.shared_attention_weight_manager: SharedAttentionWeightManager | None = None
+        if parallel_config is not None and getattr(parallel_config, "enable_sp_shared_attention_weights", False):
+            self._repeated_blocks = ["HunyuanImage3DecoderLayer"]
+            if quant_config is not None:
+                raise ValueError("Hunyuan shared attention weights currently support unquantized weights only")
+            if self.start_layer != 0 or self.end_layer != config.num_hidden_layers:
+                raise ValueError("Hunyuan shared attention weights currently require pipeline_parallel_size=1")
+            manager = SharedAttentionWeightManager(get_sp_group())
+            for decoder_layer in self.layers:
+                manager.register_layer(
+                    decoder_layer.layer_idx,
+                    decoder_layer.self_attn.qkv_proj,
+                    decoder_layer.self_attn.o_proj,
+                )
+                decoder_layer.register_forward_pre_hook(
+                    partial(self._wait_shared_attention_weights, manager, decoder_layer.layer_idx),
+                    with_kwargs=True,
+                )
+                prefetch_hook = partial(manager.prefetch_next, decoder_layer.layer_idx)
+                decoder_layer.self_attn.attn.post_kv_ready_hook = prefetch_hook
+                decoder_layer.self_attn.image_attn.attn.post_kv_ready_hook = prefetch_hook
+            self.shared_attention_weight_manager = manager
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -2075,6 +2099,17 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
+
+    @staticmethod
+    def _wait_shared_attention_weights(
+        manager: SharedAttentionWeightManager,
+        layer_idx: int,
+        module: nn.Module,
+        args,
+        kwargs,
+    ):
+        manager.wait_layer(layer_idx)
+        return None
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
@@ -2462,6 +2497,9 @@ class HunyuanImage3Model(nn.Module):
 
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
+
+        if self.shared_attention_weight_manager is not None:
+            self.shared_attention_weight_manager.begin_forward()
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:

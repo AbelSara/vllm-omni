@@ -460,6 +460,7 @@ class OrchestratorArgs:
     ulysses_mode: str = "strict"
     ring_degree: int | None = None
     allgather_degree: int | None = None
+    enable_sp_shared_attention_weights: bool = False
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1

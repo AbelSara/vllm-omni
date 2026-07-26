@@ -934,6 +934,7 @@ class AsyncOmniEngine:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             allgather_degree = normalized_kwargs.get("allgather_degree") or 1
+            enable_sp_shared_attention_weights = normalized_kwargs.get("enable_sp_shared_attention_weights", False)
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
@@ -959,6 +960,7 @@ class AsyncOmniEngine:
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
                 allgather_degree=allgather_degree,
+                enable_sp_shared_attention_weights=enable_sp_shared_attention_weights,
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,

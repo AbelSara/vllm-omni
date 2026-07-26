@@ -169,6 +169,10 @@ class DiffusionParallelConfig:
     allgather_degree: int = 1
     """Number of GPUs used for AllGather-KV sequence parallelism (causal=False only)."""
 
+    enable_sp_shared_attention_weights: bool = False
+    """Shard Hunyuan attention layers across AllGather-SP ranks and prefetch
+    complete QKV/O weights through fixed double buffers."""
+
     ulysses_mode: str = "strict"
     """Ulysses sequence-parallel mode.
 
@@ -246,6 +250,10 @@ class DiffusionParallelConfig:
                 f"Got ulysses_degree={self.ulysses_degree}, ring_degree={self.ring_degree}, "
                 f"allgather_degree={self.allgather_degree}."
             )
+        if self.enable_sp_shared_attention_weights:
+            assert self.allgather_degree > 1, "Shared attention weights require AllGather-KV SP"
+            assert self.tensor_parallel_size == 1, "Shared attention weights currently require tensor_parallel_size=1"
+            assert not self.use_hsdp, "Shared attention weights cannot be combined with HSDP"
         expected_sp_size = (
             self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
         )

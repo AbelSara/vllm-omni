@@ -110,6 +110,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ulysses_degree: int
     ring_degree: int
     allgather_degree: int
+    enable_sp_shared_attention_weights: bool
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
@@ -362,6 +363,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
+    enable_sp_shared_attention_weights: bool = False
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1, le=3)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
@@ -377,6 +379,13 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
         )
         if self.allgather_degree > 1 and (self.ulysses_degree > 1 or self.ring_degree > 1):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
+        if self.enable_sp_shared_attention_weights:
+            if self.allgather_degree <= 1:
+                raise ValueError("enable_sp_shared_attention_weights requires allgather_degree > 1")
+            if self.tensor_parallel_size != 1:
+                raise ValueError("enable_sp_shared_attention_weights requires tensor_parallel_size=1")
+            if self.use_hsdp:
+                raise ValueError("enable_sp_shared_attention_weights cannot be combined with HSDP")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
         if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:

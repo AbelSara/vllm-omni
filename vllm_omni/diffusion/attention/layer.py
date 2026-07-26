@@ -7,6 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
@@ -117,6 +118,10 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
         self.skip_sequence_parallel = skip_sequence_parallel
+        # Optional model-owned hook invoked after SP has prepared local Q and
+        # global K/V, immediately before the attention kernel starts. Keep
+        # weight communication policy out of the generic SP strategies.
+        self.post_kv_ready_hook: Callable[[], None] | None = None
 
         self.use_ring = False
         self.ring_pg = None
@@ -267,6 +272,9 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        if self.post_kv_ready_hook is not None:
+            self.post_kv_ready_hook()
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
 

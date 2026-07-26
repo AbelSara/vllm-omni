@@ -501,6 +501,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.allgather_degree.",
         )
         omni_config_group.add_argument(
+            "--enable-sp-shared-attention-weights",
+            action="store_true",
+            default=None,
+            help=(
+                "Hunyuan-Image3 only: store attention layers round-robin across "
+                "AllGather-SP ranks and prefetch QKV/O weights through double buffers."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,

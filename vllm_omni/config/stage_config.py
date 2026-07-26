@@ -370,6 +370,7 @@ class StageDeployConfig:
     ulysses_mode: str | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
+    enable_sp_shared_attention_weights: bool | None = None
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
