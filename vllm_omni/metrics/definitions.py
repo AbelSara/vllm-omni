@@ -153,6 +153,25 @@ TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 
 
 # ============================================================================
+# Image / diffusion service-level families (issue #5811)
+# ============================================================================
+STAGE_GEN_TIME_S = METRIC_PREFIX + "stage_gen_time_s"
+REQUEST_QUEUE_WAIT_S = METRIC_PREFIX + "request_queue_wait_s"
+STAGE_WAITING_REQUESTS = METRIC_PREFIX + "stage_waiting_requests"
+NUM_INFERENCE_STEPS = METRIC_PREFIX + "num_inference_steps"
+IMAGE_COUNT_METRIC = METRIC_PREFIX + IMAGE_COUNT
+IMAGE_PIXELS_METRIC = METRIC_PREFIX + IMAGE_PIXELS
+PEAK_MEMORY_MB = METRIC_PREFIX + "peak_memory_mb"
+REQUESTS_FAILED = METRIC_PREFIX + "requests_failed"
+KV_WAIT_S = METRIC_PREFIX + "kv_wait_s"
+DIFFUSION_FORWARD_S = METRIC_PREFIX + "diffusion_forward_s"
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_EXEC_PER_STEP_S = METRIC_PREFIX + "diffusion_exec_per_step_s"
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+
+
+# ============================================================================
 # Label sets
 # ============================================================================
 PIPELINE_LABELS = ("model_name",)
@@ -162,6 +181,11 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 # OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
 # ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
+
+STAGE_GEN_TIME_LABELS = ("model_name", "stage")
+DIFFUSION_LABELS = ("model_name", "stage")
+FAILED_LABELS = ("model_name", "reason")
+KV_WAIT_LABELS = ("model_name", "connector_type")
 
 # Audio continuity Counter carries an extra ``threshold_ms`` label so multiple
 # threshold buckets can be tracked simultaneously. The ``_ms`` suffix names a

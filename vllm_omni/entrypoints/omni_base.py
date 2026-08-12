@@ -197,6 +197,7 @@ class OmniBase(PDDisaggregationMixin):
         # (which forwards it to the Orchestrator background thread for
         # TX-side emit; see Orchestrator._forward_to_next_stage).
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
+        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
@@ -204,6 +205,7 @@ class OmniBase(PDDisaggregationMixin):
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
             transfer_emitter=self.transfer_metrics,
+            prom_metrics=self.prom_metrics,
             log_stats=log_stats,
             **kwargs,
         )
@@ -219,7 +221,6 @@ class OmniBase(PDDisaggregationMixin):
 
         self.request_states: dict[str, ClientRequestState] = {}
         self._consumed_metric_messages: dict[str, set[int]] = {}
-        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -341,7 +342,7 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
         return normalized
 
-    def _fire_failure_counter_if_alive(self, request_id: str) -> None:
+    def _fire_failure_counter_if_alive(self, request_id: str, reason: str = "stage_error") -> None:
         """Fire the abort/exception bucket of requests_success_total.
 
         Called from cancel / exception paths in async_omni.generate() BEFORE
@@ -356,14 +357,16 @@ class OmniBase(PDDisaggregationMixin):
             return
         if str(request_id) not in req_state.metrics.e2e_done:
             prom.request_failed()
+            prom.inc_requests_failed(reason)
 
-    def _log_summary_and_cleanup(self, request_id: str) -> None:
+    def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
         try:
             if req_state is None or req_state.metrics is None:
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
                 self.prom_metrics.request_failed()
+                self.prom_metrics.inc_requests_failed(reason)
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
@@ -580,6 +583,11 @@ class OmniBase(PDDisaggregationMixin):
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
+                self.prom_metrics.observe_stage_gen_time(stage_id, _m.stage_gen_time_ms / 1000.0)
+                self.prom_metrics.observe_image_pixels(_m.image_pixels)
+                self.prom_metrics.observe_num_inference_steps(_m.num_inference_steps)
+                if _m.output_unit_type == "image":
+                    self.prom_metrics.inc_image_count(_m.output_unit_count)
 
         if not stage_meta.final_output:
             return None
@@ -612,6 +620,13 @@ class OmniBase(PDDisaggregationMixin):
                         _prompt_tok += int(evt.num_tokens_in)
                     _gen_tok += int(evt.num_tokens_out)
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
+
+                if peak_memory_mb:
+                    self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
+                if _m is not None and _m.pipeline_timings:
+                    _qw_ms = float(_m.pipeline_timings.get("queue_wait_ms", 0.0) or 0.0)
+                    if _qw_ms > 0:
+                        self.prom_metrics.observe_queue_wait(_qw_ms / 1000.0)
 
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
