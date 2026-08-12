@@ -1,13 +1,12 @@
-"""Verify the issue #5811 image / diffusion metric family constants.
+"""Verify the image / diffusion metric family constants.
 
 Pins:
-- 14 new family names share the ``vllm_omni:`` prefix (10 from issue #5811
-  + 4 from PR #4755)
+- 16 family names share the ``vllm_omni:`` prefix
 - Counter-family constant values don't include ``_total`` (auto-suffixed by
   the prometheus_client at exposition)
 - All family names are unique within the new set and against the pre-existing
   families
-- New label sets are non-empty and well-formed, matching the issue spec
+- New label sets are non-empty and well-formed
 """
 
 from __future__ import annotations
@@ -19,11 +18,10 @@ from vllm_omni.metrics import definitions as defs
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-# ---------------------------------------------------------------------------
-# 7 Tier 2 (data already produced) + 3 Tier 3 (new data source) = 10 new
-# family constants added by issue #5811.
-# ---------------------------------------------------------------------------
-_TIER2_FAMILIES = [
+# Per-stage service metrics: generation latency, queue wait, in-flight
+# waiting requests, inference step count, image count / pixel throughput,
+# and peak memory usage.
+_STAGE_SERVICE_FAMILIES = [
     defs.STAGE_GEN_TIME_S,
     defs.REQUEST_QUEUE_WAIT_S,
     defs.STAGE_WAITING_REQUESTS,
@@ -33,38 +31,54 @@ _TIER2_FAMILIES = [
     defs.PEAK_MEMORY_MB,
 ]
 
-_TIER3_FAMILIES = [
+# Failure counter, KV transfer wait, and diffusion forward-pass latency.
+# These carry distinct label dimensions (reason / connector_type / replica)
+# beyond the per-stage service set above.
+_FAILURE_KV_FORWARD_FAMILIES = [
     defs.REQUESTS_FAILED,
     defs.KV_WAIT_S,
     defs.DIFFUSION_FORWARD_S,
 ]
 
-# PR #4755 — 4 diffusion engine timing histograms (exec / exec_per_step /
-# preprocess / postprocess). Distinct from issue #5811's diffusion_forward_s
-# (Tier 3) — these come from the diffusion engine's step_streaming emit and
-# are wired through OmniModalityMetrics, not OmniPrometheusMetrics.
-_PR4755_FAMILIES = [
+# Diffusion engine breakdown timings emitted by step_streaming: total exec,
+# per-step exec, preprocess, and postprocess. Served from
+# OmniModalityMetrics (per-(stage, replica) labels).
+_DIFFUSION_ENGINE_TIMING_FAMILIES = [
     defs.DIFFUSION_EXEC_S,
     defs.DIFFUSION_EXEC_PER_STEP_S,
     defs.DIFFUSION_PREPROCESS_S,
     defs.DIFFUSION_POSTPROCESS_S,
 ]
 
-_NEW_FAMILIES = _TIER2_FAMILIES + _TIER3_FAMILIES + _PR4755_FAMILIES
+# VAE decode latency (sourced from DiffusionOutput.stage_durations via the
+# diffusion pipeline profiler) + mean per-step denoise latency (sourced from
+# StageRequestStats.denoise_step_latency_ms). Both surface on
+# OmniModalityMetrics alongside the diffusion engine timings above.
+_VAE_DENOISE_FAMILIES = [
+    defs.VAE_DECODE_S,
+    defs.DENOISE_STEP_LATENCY_S,
+]
+
+_NEW_FAMILIES = (
+    _STAGE_SERVICE_FAMILIES + _FAILURE_KV_FORWARD_FAMILIES + _DIFFUSION_ENGINE_TIMING_FAMILIES + _VAE_DENOISE_FAMILIES
+)
 
 
 class TestFamilyCount:
-    def test_tier2_has_7_families(self) -> None:
-        assert len(_TIER2_FAMILIES) == 7
+    def test_stage_service_has_7_families(self) -> None:
+        assert len(_STAGE_SERVICE_FAMILIES) == 7
 
-    def test_tier3_has_3_families(self) -> None:
-        assert len(_TIER3_FAMILIES) == 3
+    def test_failure_kv_forward_has_3_families(self) -> None:
+        assert len(_FAILURE_KV_FORWARD_FAMILIES) == 3
 
-    def test_pr4755_has_4_families(self) -> None:
-        assert len(_PR4755_FAMILIES) == 4
+    def test_diffusion_engine_timing_has_4_families(self) -> None:
+        assert len(_DIFFUSION_ENGINE_TIMING_FAMILIES) == 4
 
-    def test_total_14_new_families(self) -> None:
-        assert len(_NEW_FAMILIES) == 14
+    def test_vae_denoise_has_2_families(self) -> None:
+        assert len(_VAE_DENOISE_FAMILIES) == 2
+
+    def test_total_16_new_families(self) -> None:
+        assert len(_NEW_FAMILIES) == 16
 
 
 class TestPrefix:
@@ -123,10 +137,6 @@ class TestCounterSuffix:
 
 
 class TestLabelSets:
-    """Issue #5811 label set pins. Each label set matches the issue spec
-    exactly — narrower than the original design doc to keep scope tight.
-    """
-
     def test_new_label_sets_nonempty_and_well_formed(self) -> None:
         for labels in (
             defs.STAGE_GEN_TIME_LABELS,
@@ -139,12 +149,12 @@ class TestLabelSets:
                 f"label set {labels!r} contains non-str or empty entries"
             )
 
-    def test_stage_gen_time_labels_match_issue_spec(self) -> None:
-        # Issue #5811 spec: {model_name, stage}. No final_output_type —
-        # per-modality slicing goes through e2e_request_latency_s.
+    def test_stage_gen_time_labels_are_model_and_stage(self) -> None:
+        # No final_output_type — per-modality slicing goes through
+        # e2e_request_latency_s.
         assert defs.STAGE_GEN_TIME_LABELS == ("model_name", "stage")
 
-    def test_diffusion_labels_match_issue_spec(self) -> None:
+    def test_diffusion_labels_are_model_and_stage(self) -> None:
         # Used by stage_waiting_requests + peak_memory_mb (per-stage gauges).
         assert defs.DIFFUSION_LABELS == ("model_name", "stage")
 
@@ -157,5 +167,5 @@ class TestLabelSets:
         assert defs.KV_WAIT_LABELS == ("model_name", "connector_type")
 
     def test_stage_labels_carry_replica(self) -> None:
-        # Used by diffusion_forward_s (Tier 3) which is per-(stage, replica).
+        # Used by diffusion_forward_s which is per-(stage, replica).
         assert defs.STAGE_LABELS == ("model_name", "stage", "replica")

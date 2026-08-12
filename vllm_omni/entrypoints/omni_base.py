@@ -631,6 +631,12 @@ class OmniBase(PDDisaggregationMixin):
                 self.prom_metrics.observe_num_inference_steps(_m.num_inference_steps)
                 if _m.output_unit_type == "image":
                     self.prom_metrics.inc_image_count(_m.output_unit_count)
+                    if result.replica_id is not None:
+                        self.mod_metrics.observe_denoise_step_latency(
+                            str(stage_id),
+                            str(result.replica_id),
+                            _m.denoise_step_latency_ms / 1000.0,
+                        )
 
         if not stage_meta.final_output:
             return None

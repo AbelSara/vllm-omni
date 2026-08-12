@@ -1,4 +1,4 @@
-"""Verify issue #5811 emit-call wiring in production code paths.
+"""Verify emit-call wiring in production code paths.
 
 `test_definitions.py` pins the family constants and label shapes; this file
 pins that the production side actually calls the observe / inc / set helpers
@@ -45,12 +45,14 @@ class TestEmitCallSiteStatic:
         from vllm_omni.entrypoints.omni_base import OmniBase
 
         src = inspect.getsource(OmniBase._process_single_result)
-        # Tier 2 per-stage finish block.
+        # Per-stage finish block.
         assert "observe_stage_gen_time(" in src, "missing observe_stage_gen_time emit"
         assert "observe_image_pixels(" in src, "missing observe_image_pixels emit"
         assert "observe_num_inference_steps(" in src, "missing observe_num_inference_steps emit"
         assert "inc_image_count(" in src, "missing inc_image_count emit"
-        # Tier 2 finalize-time block.
+        # Per-step denoise latency emit, scoped to image output_unit_type.
+        assert "observe_denoise_step_latency(" in src, "missing observe_denoise_step_latency emit"
+        # Finalize-time block.
         assert "set_peak_memory(" in src, "missing set_peak_memory emit"
         assert "observe_queue_wait(" in src, "missing observe_queue_wait emit"
 
@@ -107,8 +109,6 @@ class TestFailureCounterWiring:
     call BOTH the legacy `request_failed()` (which writes the abort bucket of
     `requests_success_total`) and the new `inc_requests_failed(reason)` (which
     writes `requests_failed_total` with the reason taxonomy).
-
-    The reason taxonomy is the Tier 3 lock — see `docs/metrics_diffusion_extension.md`.
     """
 
     def test_fire_failure_counter_passes_reason_through(self) -> None:

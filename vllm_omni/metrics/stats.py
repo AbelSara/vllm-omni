@@ -579,10 +579,10 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
-        # Preserve float for seconds-bearing keys (PR #4755 timing surface),
-        # int for everything else so the log table doesn't render counts as
-        # ``1.0`` / ``2.0``. The accumulator already converted engine-side
-        # ``_ms`` emits to ``_s`` keys via ``_MS_TO_S``.
+        # Preserve float for seconds-bearing keys, int for everything else so
+        # the log table doesn't render counts as ``1.0`` / ``2.0``. The
+        # accumulator already converted engine-side ``_ms`` emits to ``_s``
+        # keys via ``_MS_TO_S``.
         stats.diffusion_metrics = (
             {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
@@ -638,6 +638,7 @@ class OrchestratorAggregator:
         "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
         "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
         "postprocess_time_ms": "postprocess_time_s",
+        "vae_decode_time_ms": "vae_decode_time_s",
     }
 
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:

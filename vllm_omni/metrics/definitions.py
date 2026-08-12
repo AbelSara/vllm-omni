@@ -153,7 +153,7 @@ TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
 
 
 # ============================================================================
-# Image / diffusion service-level families (issue #5811)
+# Image / diffusion service-level families
 # ============================================================================
 STAGE_GEN_TIME_S = METRIC_PREFIX + "stage_gen_time_s"
 REQUEST_QUEUE_WAIT_S = METRIC_PREFIX + "request_queue_wait_s"
@@ -169,6 +169,8 @@ DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
 DIFFUSION_EXEC_PER_STEP_S = METRIC_PREFIX + "diffusion_exec_per_step_s"
 DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
 DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+VAE_DECODE_S = METRIC_PREFIX + "vae_decode_s"
+DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
 
 
 # ============================================================================

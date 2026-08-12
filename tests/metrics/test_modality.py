@@ -46,6 +46,8 @@ _EXPECTED_FAMILIES = [
     defs.DIFFUSION_EXEC_PER_STEP_S,
     defs.DIFFUSION_PREPROCESS_S,
     defs.DIFFUSION_POSTPROCESS_S,
+    defs.VAE_DECODE_S,
+    defs.DENOISE_STEP_LATENCY_S,
 ]
 
 
@@ -63,6 +65,8 @@ class TestRegistration:
         mod.observe_diffusion_exec_per_step("s", "r", 0.01)
         mod.observe_diffusion_preprocess("s", "r", 0.01)
         mod.observe_diffusion_postprocess("s", "r", 0.2)
+        mod.observe_vae_decode("s", "r", 0.3)
+        mod.observe_denoise_step_latency("s", "r", 0.05)
 
         out = generate_latest(REGISTRY).decode()
         for name in _EXPECTED_FAMILIES:
@@ -246,6 +250,12 @@ class _StubModMetrics:
 
     def observe_diffusion_postprocess(self, s, r, v):
         self.calls.append(("observe_diffusion_postprocess", s, r, v))
+
+    def observe_vae_decode(self, s, r, seconds):
+        self.calls.append(("observe_vae_decode", s, r, seconds))
+
+    def observe_denoise_step_latency(self, s, r, seconds):
+        self.calls.append(("observe_denoise_step_latency", s, r, seconds))
 
 
 class _Bag:
@@ -452,6 +462,44 @@ class TestObserveDiffusionFinalize:
         assert ("observe_diffusion_preprocess", "2", "0", 0.05) in stub.calls
         assert ("observe_diffusion_postprocess", "2", "0", 0.02) in stub.calls
 
+    def test_diffusion_path_emits_vae_decode(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            diffusion_metrics={
+                "diffusion_engine_exec_time_s": 1.0,
+                "vae_decode_time_s": 0.3,
+            },
+            num_inference_steps=10,
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert ("observe_vae_decode", "2", "0", 0.3) in stub.calls
+
+    def test_diffusion_path_skips_vae_decode_when_key_missing(self):
+        # When the profiler is off, vae_decode_time_ms is never emitted by
+        # the engine, so the accumulator dict lacks the ``_s`` key and the
+        # dispatcher must skip — no zero-valued observation.
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            diffusion_metrics={"diffusion_engine_exec_time_s": 1.0},
+            num_inference_steps=10,
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0] == "observe_vae_decode" for c in stub.calls)
+
     def test_audio_diffusion_stage_fires_both_paths(self):
         # stable_audio: output_type=audio AND diffusion_metrics populated.
         # Dispatcher must route to BOTH diffusion AND audio helpers.
@@ -582,7 +630,7 @@ class TestObserveDiffusionFinalize:
         # test_diffusion_engine_metrics.py); the accumulator converts it to
         # ``_s`` for symmetry but the dispatcher must NOT route it to any
         # Prometheus family — exec / preprocess / postprocess already cover
-        # the timing surface PR #4755 wires.
+        # the timing surface.
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,
@@ -757,3 +805,50 @@ class TestBucketSelection:
         out = generate_latest(REGISTRY).decode()
         fast_marker = f'{defs.DIFFUSION_POSTPROCESS_S}_bucket{{le="0.001"'
         assert fast_marker in out, "diffusion_postprocess_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+
+    def test_vae_decode_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
+        # VAE decode can stretch into seconds for high-resolution latents;
+        # stays on the wide bucket so the 300 s ceiling covers video VAE.
+        stage, replica = "vae_decode_sec", "0"
+        mod.observe_vae_decode(stage, replica, 1.5)
+        out = generate_latest(REGISTRY).decode()
+        sec_marker = f'{defs.VAE_DECODE_S}_bucket{{le="300.0"'
+        assert sec_marker in out, "vae_decode_s should use SECONDS_BUCKETS containing le=300.0"
+
+    def test_denoise_step_latency_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
+        # Per-step denoise is sub-second; stays on the fast bucket for ms-level
+        # resolution.
+        stage, replica = "denoise_fast", "0"
+        mod.observe_denoise_step_latency(stage, replica, 0.075)
+        out = generate_latest(REGISTRY).decode()
+        fast_marker = f'{defs.DENOISE_STEP_LATENCY_S}_bucket{{le="0.001"'
+        assert fast_marker in out, "denoise_step_latency_s should use SECONDS_FAST_BUCKETS containing le=0.001"
+
+
+class TestDenoiseStepLatencyGuard:
+    """``observe_denoise_step_latency`` uses a ``<= 0`` guard so text / AR
+    stages that contribute zero don't bump ``_count``. The emit site in
+    ``omni_base._process_single_result`` calls unconditionally inside the
+    image branch — the guard keeps zero samples out of the histogram.
+    """
+
+    def test_zero_skipped(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "denoise_zero", "0"
+        mod.observe_denoise_step_latency(stage, replica, 0.0)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) is None
+
+    def test_negative_skipped(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "denoise_neg", "0"
+        mod.observe_denoise_step_latency(stage, replica, -0.1)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) is None
+
+    def test_positive_observed(self, mod: OmniModalityMetrics) -> None:
+        stage, replica = "denoise_pos", "0"
+        mod.observe_denoise_step_latency(stage, replica, 0.05)
+        out = generate_latest(REGISTRY).decode()
+        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
+        assert _sample_value(out, prefix) == 1.0
