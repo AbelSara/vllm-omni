@@ -709,6 +709,7 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
+            num_inference_steps=num_inference_steps,
             denoise_step_latency_ms=denoise_step_latency_ms,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,

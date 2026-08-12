@@ -357,6 +357,7 @@ class Orchestrator:
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
+    _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
 
@@ -372,6 +373,7 @@ class Orchestrator:
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
+        prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
@@ -386,6 +388,7 @@ class Orchestrator:
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
         self.log_stats = log_stats
+        self._prom_metrics = prom_metrics
         self._orch_monitor = create_orch_monitor(
             enabled=enable_orch_monitor,
             replica_sampler=self._sample_replica_metrics,
@@ -1023,6 +1026,15 @@ class Orchestrator:
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
                                     engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                                )
+                            _sched_stats = raw_outputs.scheduler_stats
+                            if (
+                                self._prom_metrics is not None
+                                and _sched_stats is not None
+                                and getattr(_sched_stats, "num_waiting_reqs", None) is not None
+                            ):
+                                self._prom_metrics.set_stage_waiting_requests(
+                                    stage_id, int(_sched_stats.num_waiting_reqs)
                                 )
                     except asyncio.CancelledError:
                         raise

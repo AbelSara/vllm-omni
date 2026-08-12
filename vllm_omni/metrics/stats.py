@@ -49,6 +49,7 @@ class StageRequestStats:
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
     image_pixels: int = 0
+    num_inference_steps: int = 0
     denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
     output_unit_type: str | None = None
@@ -578,6 +579,10 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
+        # Preserve float for seconds-bearing keys (PR #4755 timing surface),
+        # int for everything else so the log table doesn't render counts as
+        # ``1.0`` / ``2.0``. The accumulator already converted engine-side
+        # ``_ms`` emits to ``_s`` keys via ``_MS_TO_S``.
         stats.diffusion_metrics = (
             {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
@@ -628,10 +633,21 @@ class OrchestratorAggregator:
             _postproc_ms = (time.perf_counter() - _t0) * 1000.0
             self.record_stage_postprocess_time(stage_id, req_id, _postproc_ms)
 
+    _MS_TO_S: dict[str, str] = {
+        "preprocess_time_ms": "preprocess_time_s",
+        "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
+        "postprocess_time_ms": "postprocess_time_s",
+    }
+
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
         """Accumulate diffusion metrics for a request.
 
-        Handles extraction and accumulation of diffusion stage metrics.
+        Engine emits ``*_ms`` timings; the accumulator converts them to ``_s``
+        keys via ``_MS_TO_S`` so downstream observers read a uniform
+        seconds-bearing dict. Per-chunk timing keys are summed; non-timing
+        keys (e.g. ``image_num`` / ``resolution`` from ``format_diffusion_outputs``)
+        preserve the existing ``+=`` semantics.
 
         Args:
             req_id: Request ID
@@ -643,20 +659,16 @@ class OrchestratorAggregator:
         diffusion_metrics: dict = getattr(engine_output, "metrics", {})
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
-        if diffusion_metrics:
-            _MS_TO_S = {
-                "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
-                "preprocess_time_ms": "preprocess_time_s",
-                "postprocess_time_ms": "postprocess_time_s",
-                "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
-            }
-            for key, value in diffusion_metrics.items():
-                if value is None:
-                    continue
-                if key in _MS_TO_S:
-                    self.diffusion_metrics[req_id][_MS_TO_S[key]] = float(value) / 1000.0
-                else:
-                    self.diffusion_metrics[req_id][key] = value
+        if not diffusion_metrics:
+            return
+        bucket = self.diffusion_metrics[req_id]
+        for key, value in diffusion_metrics.items():
+            if value is None:
+                continue
+            if key in self._MS_TO_S:
+                bucket[self._MS_TO_S[key]] += float(value) / 1000.0
+            else:
+                bucket[key] += float(value)
 
     def on_forward(
         self,

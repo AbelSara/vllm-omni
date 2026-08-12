@@ -216,19 +216,44 @@ def observe_modality_at_finalize(
     stage_metrics: Any,
     engine_outputs: Any,
 ) -> None:
-    """Route audio-path observations for a finalized request.
+    """Route per-modality observations for a finalized request.
 
     Used by ``omni_base._process_single_result`` inside the e2e_done finalize
-    guard so it fires once per request. Skips text path (covered by upstream
-    ``vllm:*{stage="thinker", ...}``) and any case where required inputs are
-    missing — caller should not need to pre-validate.
+    guard so it fires once per request. Text path falls through — covered by
+    upstream ``vllm:*{stage="thinker", ...}``. Caller should not need to
+    pre-validate; missing inputs are silently skipped.
 
     audio_ttfp is intentionally NOT observed here; it's emitted by the
     streaming hook at first-packet time, not at finalize.
     """
-    if replica_id is None or stage_metrics is None or output_type is None:
+    if replica_id is None or stage_metrics is None:
         return
 
+    _observe_diffusion_finalize(
+        mod_metrics,
+        stage_id=stage_id,
+        replica_id=replica_id,
+        stage_metrics=stage_metrics,
+    )
+
+    if output_type == "audio":
+        _observe_audio_finalize(
+            mod_metrics,
+            stage_id=stage_id,
+            replica_id=replica_id,
+            stage_metrics=stage_metrics,
+            engine_outputs=engine_outputs,
+        )
+
+
+def _observe_audio_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+    engine_outputs: Any,
+) -> None:
     stage_label = str(stage_id)
     replica_label = str(replica_id)
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
@@ -271,6 +296,41 @@ def observe_modality_at_finalize(
                 replica_label,
                 float(exec_time) / int(num_steps),
             )
+
+
+_DIFFUSION_EXEC_KEY = "diffusion_engine_exec_time_s"
+_DIFFUSION_PREPROCESS_KEY = "preprocess_time_s"
+_DIFFUSION_POSTPROCESS_KEY = "postprocess_time_s"
+
+
+def _observe_diffusion_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+) -> None:
+    diff_metrics = getattr(stage_metrics, "diffusion_metrics", None)
+    if not diff_metrics:
+        return
+
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+
+    exec_s = diff_metrics.get(_DIFFUSION_EXEC_KEY)
+    if exec_s is not None:
+        mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
+        num_steps = int(getattr(stage_metrics, "num_inference_steps", 0) or 0)
+        if num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
+
+    pre_s = diff_metrics.get(_DIFFUSION_PREPROCESS_KEY)
+    if pre_s is not None:
+        mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
+
+    post_s = diff_metrics.get(_DIFFUSION_POSTPROCESS_KEY)
+    if post_s is not None:
+        mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
 
 
 def observe_audio_first_packet(
