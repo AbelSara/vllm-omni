@@ -586,6 +586,12 @@ class OmniBase(PDDisaggregationMixin):
                 self.prom_metrics.observe_stage_gen_time(stage_id, _m.stage_gen_time_ms / 1000.0)
                 self.prom_metrics.observe_image_pixels(_m.image_pixels)
                 self.prom_metrics.observe_num_inference_steps(_m.num_inference_steps)
+                # In-stage pool wait ≈ stage_gen_time minus diffusion engine exec.
+                # Only meaningful for diffusion stages (text stages have no exec key).
+                _diff_m = _m.diffusion_metrics or {}
+                _exec_s = _diff_m.get("diffusion_engine_exec_time_s")
+                if _exec_s is not None:
+                    self.prom_metrics.observe_stage_in_queue(stage_id, _m.stage_gen_time_ms / 1000.0 - float(_exec_s))
                 if _m.output_unit_type == "image":
                     self.prom_metrics.inc_image_count(_m.output_unit_count)
                     if result.replica_id is not None:
@@ -593,6 +599,11 @@ class OmniBase(PDDisaggregationMixin):
                             str(stage_id),
                             str(result.replica_id),
                             _m.denoise_step_latency_ms / 1000.0,
+                        )
+                        self.mod_metrics.observe_image_ttfp(
+                            str(stage_id),
+                            str(result.replica_id),
+                            _m.serving_time_to_first_output_ms / 1000.0,
                         )
 
         if not stage_meta.final_output:

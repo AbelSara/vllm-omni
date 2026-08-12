@@ -138,15 +138,19 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
     return value
 
 
-def _extract_vae_decode_ms(output: Any) -> float | None:
-    """Sum accumulated VAE-decode seconds out of ``DiffusionOutput.stage_durations``."""
+def _sum_stage_durations_ms(output: Any, suffix: str) -> float | None:
+    """Sum ``stage_durations`` values for keys ending in ``suffix`` (→ ms).
+
+    Returns ``None`` when no key matches (profiler off) so callers skip the
+    emit rather than observe a zero sample.
+    """
     durations = getattr(output, "stage_durations", None)
     if not isinstance(durations, dict):
         return None
     total = 0.0
     found = False
     for key, value in durations.items():
-        if not key.endswith(".vae.decode"):
+        if not key.endswith(suffix):
             continue
         try:
             total += float(value)
@@ -154,6 +158,15 @@ def _extract_vae_decode_ms(output: Any) -> float | None:
         except (TypeError, ValueError):
             continue
     return total * 1000.0 if found else None
+
+
+def _extract_vae_decode_ms(output: Any) -> float | None:
+    return _sum_stage_durations_ms(output, ".vae.decode")
+
+
+def _extract_diffuse_ms(output: Any) -> float | None:
+    # .diffuse = the denoise loop (transformer forward + per-step scheduler).
+    return _sum_stage_durations_ms(output, ".diffuse")
 
 
 @dataclass
@@ -389,6 +402,12 @@ class DiffusionEngine:
                 vae_decode_ms = _extract_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                forward_ms = _extract_diffuse_ms(output)
+                if forward_ms is not None:
+                    metrics_update["forward_time_ms"] = forward_ms
+                kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
+                if kv_recv_ms > 0:
+                    metrics_update["kv_recv_time_ms"] = kv_recv_ms
                 request_output.metrics.update(metrics_update)
             yield formatted_outputs
 

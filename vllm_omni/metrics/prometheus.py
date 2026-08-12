@@ -75,6 +75,14 @@ _peak_memory_family = Gauge(
     "Peak GPU memory in MB observed during a stage's generation.",
     labelnames=list(defs.DIFFUSION_LABELS),
 )
+_stage_in_queue_family = Histogram(
+    defs.STAGE_IN_QUEUE_S,
+    "In-stage pool queue wait in seconds (stage_gen_time minus diffusion "
+    "engine exec). Approximates the time a request waited in the stage pool "
+    "before execution began.",
+    labelnames=list(defs.STAGE_GEN_TIME_LABELS),
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
 
 _requests_failed_family = Counter(
     defs.REQUESTS_FAILED,
@@ -87,14 +95,6 @@ _kv_wait_s_family = Histogram(
     defs.KV_WAIT_S,
     "KV cache transfer wait time per request, sliced by connector backend.",
     labelnames=list(defs.KV_WAIT_LABELS),
-    buckets=defs.SECONDS_BUCKETS,
-)
-_diffusion_forward_s_family = Histogram(
-    defs.DIFFUSION_FORWARD_S,
-    "Diffusion forward-only latency in seconds (excludes preprocess / "
-    "postprocess / KV load). Sub-timer split inside the diffusion runner "
-    "is the wire-up point.",
-    labelnames=list(defs.STAGE_LABELS),
     buckets=defs.SECONDS_BUCKETS,
 )
 
@@ -168,6 +168,14 @@ class OmniPrometheusMetrics:
             stage=str(stage),
         ).observe(max(gen_time_s, 0.0))
 
+    def observe_stage_in_queue(self, stage: int, in_queue_s: float) -> None:
+        if not self._log_stats or in_queue_s <= 0:
+            return
+        _stage_in_queue_family.labels(
+            model_name=self._model_name,
+            stage=str(stage),
+        ).observe(in_queue_s)
+
     def observe_queue_wait(self, queue_wait_s: float) -> None:
         if not self._log_stats:
             return
@@ -209,7 +217,8 @@ class OmniPrometheusMetrics:
             stage=str(stage),
         ).set(max(peak_memory_mb, 0.0))
 
-    # Failure / KV transfer / diffusion forward-pass families.
+    # Failure / KV transfer families. diffusion_forward_s lives on
+    # OmniModalityMetrics (rides _observe_diffusion_finalize).
 
     def inc_requests_failed(self, reason: str) -> None:
         if not self._log_stats:
@@ -226,20 +235,6 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             connector_type=connector_type or "unknown",
         ).observe(kv_wait_s)
-
-    def observe_diffusion_forward(
-        self,
-        stage: int,
-        replica: int,
-        forward_s: float,
-    ) -> None:
-        if not self._log_stats or forward_s < 0:
-            return
-        _diffusion_forward_s_family.labels(
-            model_name=self._model_name,
-            stage=str(stage),
-            replica=str(replica),
-        ).observe(forward_s)
 
 
 class OmniRequestCounter:

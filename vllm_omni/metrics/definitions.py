@@ -171,6 +171,9 @@ DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
 DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
 VAE_DECODE_S = METRIC_PREFIX + "vae_decode_s"
 DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
+DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
+IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
+STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
 
 
 # ============================================================================

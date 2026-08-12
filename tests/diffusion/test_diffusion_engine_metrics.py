@@ -127,6 +127,39 @@ class TestVaeDecodeEmit:
         )
 
 
+class TestDiffuseForwardEmit:
+    """Forward-only timing → forward_time_ms, mirroring TestVaeDecodeEmit."""
+
+    def test_extract_diffuse_ms_helper_exists(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        helper_src = _get_function_source(source, None, "_extract_diffuse_ms")
+        assert ".diffuse" in helper_src, "helper must key on the '.diffuse' suffix"
+        assert "stage_durations" in helper_src, "helper must read from output.stage_durations"
+
+    def test_step_streaming_emits_forward_time_ms(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
+        assert "_extract_diffuse_ms(" in step_streaming_source, (
+            "step_streaming must call _extract_diffuse_ms to source forward-only timing"
+        )
+        assert '"forward_time_ms"' in step_streaming_source, (
+            "step_streaming must emit forward_time_ms key for the _MS_TO_S accumulator"
+        )
+
+
+class TestKvRecvEmit:
+    """KV-recv timing → kv_recv_time_ms, sourced from DiffusionOutput.kv_recv_ms
+    (set by the runner's _prepare_request_for_forward, not the profiler)."""
+
+    def test_step_streaming_emits_kv_recv_time_ms(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
+        assert "kv_recv_ms" in step_streaming_source, "step_streaming must read output.kv_recv_ms"
+        assert '"kv_recv_time_ms"' in step_streaming_source, (
+            "step_streaming must emit kv_recv_time_ms key for the _MS_TO_S accumulator"
+        )
+
+
 class TestDummyRunAllocation:
     """Verify _dummy_run generates exact-sized audio arrays."""
 

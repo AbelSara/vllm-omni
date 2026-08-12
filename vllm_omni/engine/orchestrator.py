@@ -944,6 +944,18 @@ class Orchestrator:
 
                             await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
                             for eco in raw_outputs.outputs:
+                                # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
+                                # async_chunk early-return so it lands in all modes.
+                                kv_params = getattr(eco, "kv_transfer_params", None)
+                                if (
+                                    self._prom_metrics is not None
+                                    and isinstance(kv_params, dict)
+                                    and (kv_wait_s := kv_params.get("kv_wait_s")) is not None
+                                ):
+                                    self._prom_metrics.observe_kv_wait(
+                                        kv_params.get("connector_type") or "unknown",
+                                        float(kv_wait_s),
+                                    )
                                 req_state = self.request_states.get(getattr(eco, "request_id", None))
                                 if req_state is None or not req_state.streaming.enabled:
                                     continue
