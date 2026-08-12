@@ -138,6 +138,24 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
     return value
 
 
+def _extract_vae_decode_ms(output: Any) -> float | None:
+    """Sum accumulated VAE-decode seconds out of ``DiffusionOutput.stage_durations``."""
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, dict):
+        return None
+    total = 0.0
+    found = False
+    for key, value in durations.items():
+        if not key.endswith(".vae.decode"):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total * 1000.0 if found else None
+
+
 @dataclass
 class _RpcTask:
     """A pending collective_rpc invocation queued for the busy loop."""
@@ -362,14 +380,16 @@ class DiffusionEngine:
                 step_total_ms,
             )
             for request_output in formatted_outputs:
-                request_output.metrics.update(
-                    {
-                        "preprocess_time_ms": preprocess_time * 1000,
-                        "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                        "diffusion_engine_total_time_ms": step_total_ms,
-                        "postprocess_time_ms": postprocess_time * 1000,
-                    }
-                )
+                metrics_update = {
+                    "preprocess_time_ms": preprocess_time * 1000,
+                    "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "diffusion_engine_total_time_ms": step_total_ms,
+                    "postprocess_time_ms": postprocess_time * 1000,
+                }
+                vae_decode_ms = _extract_vae_decode_ms(output)
+                if vae_decode_ms is not None:
+                    metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                request_output.metrics.update(metrics_update)
             yield formatted_outputs
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:

@@ -209,7 +209,7 @@ class OmniPrometheusMetrics:
             stage=str(stage),
         ).set(max(peak_memory_mb, 0.0))
 
-    # ---- Tier 3: family + observe API lands now; wire-up is follow-up ----
+    # Failure / KV transfer / diffusion forward-pass families.
 
     def inc_requests_failed(self, reason: str) -> None:
         if not self._log_stats:

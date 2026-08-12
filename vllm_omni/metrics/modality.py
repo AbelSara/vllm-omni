@@ -105,6 +105,18 @@ _diffusion_postprocess_family = Histogram(
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
+_vae_decode_family = Histogram(
+    defs.VAE_DECODE_S,
+    "VAE decode latency in seconds (latents -> pixels/audio/video).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_denoise_step_latency_family = Histogram(
+    defs.DENOISE_STEP_LATENCY_S,
+    "Mean per-step denoise latency in seconds (stage_gen_time / num_inference_steps).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
 
 
 class OmniModalityMetrics:
@@ -206,6 +218,16 @@ class OmniModalityMetrics:
             replica=replica,
         ).observe(seconds)
 
+    def observe_vae_decode(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _vae_decode_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_denoise_step_latency(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds <= 0:
+            return
+        _denoise_step_latency_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
 
 def observe_modality_at_finalize(
     mod_metrics: OmniModalityMetrics,
@@ -301,6 +323,7 @@ def _observe_audio_finalize(
 _DIFFUSION_EXEC_KEY = "diffusion_engine_exec_time_s"
 _DIFFUSION_PREPROCESS_KEY = "preprocess_time_s"
 _DIFFUSION_POSTPROCESS_KEY = "postprocess_time_s"
+_VAE_DECODE_KEY = "vae_decode_time_s"
 
 
 def _observe_diffusion_finalize(
@@ -331,6 +354,10 @@ def _observe_diffusion_finalize(
     post_s = diff_metrics.get(_DIFFUSION_POSTPROCESS_KEY)
     if post_s is not None:
         mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
+
+    vae_s = diff_metrics.get(_VAE_DECODE_KEY)
+    if vae_s is not None:
+        mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
 
 
 def observe_audio_first_packet(

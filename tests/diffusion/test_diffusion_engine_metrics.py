@@ -40,7 +40,7 @@ _FORMATTER_PATH = os.path.normpath(
 
 
 def _read_source(path: str) -> str:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
@@ -102,6 +102,29 @@ class TestMetricKeys:
         assert '"diffusion_engine_exec_time_ms": exec_total_time * 1000' in step_streaming_source
         assert '"diffusion_engine_total_time_ms": step_total_ms' in step_streaming_source
         assert '"postprocess_time_ms": postprocess_time * 1000' in step_streaming_source
+
+
+class TestVaeDecodeEmit:
+    """VAE decode timing is sourced from ``DiffusionOutput.stage_durations``
+    (populated by the diffusion pipeline profiler) and emitted as
+    ``vae_decode_time_ms`` so the ``_MS_TO_S`` accumulator picks it up.
+    """
+
+    def test_extract_vae_decode_ms_helper_exists(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        helper_src = _get_function_source(source, None, "_extract_vae_decode_ms")
+        assert ".vae.decode" in helper_src, "helper must key on the '.vae.decode' suffix"
+        assert "stage_durations" in helper_src, "helper must read from output.stage_durations"
+
+    def test_step_streaming_emits_vae_decode_time_ms(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
+        assert "_extract_vae_decode_ms(" in step_streaming_source, (
+            "step_streaming must call _extract_vae_decode_ms to source VAE decode timing"
+        )
+        assert '"vae_decode_time_ms"' in step_streaming_source, (
+            "step_streaming must emit vae_decode_time_ms key for the _MS_TO_S accumulator"
+        )
 
 
 class TestDummyRunAllocation:
