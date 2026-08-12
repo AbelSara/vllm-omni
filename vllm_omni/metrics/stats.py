@@ -639,6 +639,8 @@ class OrchestratorAggregator:
         "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
+        "forward_time_ms": "forward_time_s",
+        "kv_recv_time_ms": "kv_recv_time_s",
     }
 
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:

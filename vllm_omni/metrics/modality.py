@@ -111,6 +111,27 @@ _vae_decode_family = Histogram(
     labelnames=_stage_labels,
     buckets=defs.SECONDS_BUCKETS,
 )
+_diffusion_forward_family = Histogram(
+    defs.DIFFUSION_FORWARD_S,
+    "Diffusion forward-only latency in seconds (denoise loop; excludes "
+    "preprocess / postprocess / VAE decode / KV load). Absent when the "
+    "pipeline profiler is off.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_diffusion_kv_load_family = Histogram(
+    defs.DIFFUSION_KV_LOAD_S,
+    "Diffusion KV-recv latency in seconds (AR→diffusion KV fetch; absent when "
+    "the stage has no upstream KV to receive).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_image_ttfp_family = Histogram(
+    defs.IMAGE_TTFP_S,
+    "Image time-to-first-output in seconds (request arrival → first image materialized; non-streaming single-image).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
 _denoise_step_latency_family = Histogram(
     defs.DENOISE_STEP_LATENCY_S,
     "Mean per-step denoise latency in seconds (stage_gen_time / num_inference_steps).",
@@ -223,6 +244,21 @@ class OmniModalityMetrics:
             return
         _vae_decode_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
 
+    def observe_diffusion_forward(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _diffusion_forward_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_diffusion_kv_load(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _diffusion_kv_load_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_image_ttfp(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _image_ttfp_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
     def observe_denoise_step_latency(self, stage: str, replica: str, seconds: float) -> None:
         if not self._log_stats or seconds <= 0:
             return
@@ -324,6 +360,8 @@ _DIFFUSION_EXEC_KEY = "diffusion_engine_exec_time_s"
 _DIFFUSION_PREPROCESS_KEY = "preprocess_time_s"
 _DIFFUSION_POSTPROCESS_KEY = "postprocess_time_s"
 _VAE_DECODE_KEY = "vae_decode_time_s"
+_DIFFUSION_FORWARD_KEY = "forward_time_s"
+_DIFFUSION_KV_LOAD_KEY = "kv_recv_time_s"
 
 
 def _observe_diffusion_finalize(
@@ -358,6 +396,14 @@ def _observe_diffusion_finalize(
     vae_s = diff_metrics.get(_VAE_DECODE_KEY)
     if vae_s is not None:
         mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
+
+    forward_s = diff_metrics.get(_DIFFUSION_FORWARD_KEY)
+    if forward_s is not None:
+        mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
+
+    kv_load_s = diff_metrics.get(_DIFFUSION_KV_LOAD_KEY)
+    if kv_load_s is not None:
+        mod_metrics.observe_diffusion_kv_load(stage_label, replica_label, float(kv_load_s))
 
 
 def observe_audio_first_packet(

@@ -29,6 +29,7 @@ _STAGE_SERVICE_FAMILIES = [
     defs.IMAGE_COUNT_METRIC,
     defs.IMAGE_PIXELS_METRIC,
     defs.PEAK_MEMORY_MB,
+    defs.STAGE_IN_QUEUE_S,
 ]
 
 # Failure counter, KV transfer wait, and diffusion forward-pass latency.
@@ -41,22 +42,24 @@ _FAILURE_KV_FORWARD_FAMILIES = [
 ]
 
 # Diffusion engine breakdown timings emitted by step_streaming: total exec,
-# per-step exec, preprocess, and postprocess. Served from
+# per-step exec, preprocess, postprocess, and KV-recv. Served from
 # OmniModalityMetrics (per-(stage, replica) labels).
 _DIFFUSION_ENGINE_TIMING_FAMILIES = [
     defs.DIFFUSION_EXEC_S,
     defs.DIFFUSION_EXEC_PER_STEP_S,
     defs.DIFFUSION_PREPROCESS_S,
     defs.DIFFUSION_POSTPROCESS_S,
+    defs.DIFFUSION_KV_LOAD_S,
 ]
 
 # VAE decode latency (sourced from DiffusionOutput.stage_durations via the
 # diffusion pipeline profiler) + mean per-step denoise latency (sourced from
-# StageRequestStats.denoise_step_latency_ms). Both surface on
-# OmniModalityMetrics alongside the diffusion engine timings above.
+# StageRequestStats.denoise_step_latency_ms) + image time-to-first-output.
+# All surface on OmniModalityMetrics alongside the diffusion engine timings.
 _VAE_DENOISE_FAMILIES = [
     defs.VAE_DECODE_S,
     defs.DENOISE_STEP_LATENCY_S,
+    defs.IMAGE_TTFP_S,
 ]
 
 _NEW_FAMILIES = (
@@ -65,20 +68,20 @@ _NEW_FAMILIES = (
 
 
 class TestFamilyCount:
-    def test_stage_service_has_7_families(self) -> None:
-        assert len(_STAGE_SERVICE_FAMILIES) == 7
+    def test_stage_service_has_8_families(self) -> None:
+        assert len(_STAGE_SERVICE_FAMILIES) == 8
 
     def test_failure_kv_forward_has_3_families(self) -> None:
         assert len(_FAILURE_KV_FORWARD_FAMILIES) == 3
 
-    def test_diffusion_engine_timing_has_4_families(self) -> None:
-        assert len(_DIFFUSION_ENGINE_TIMING_FAMILIES) == 4
+    def test_diffusion_engine_timing_has_5_families(self) -> None:
+        assert len(_DIFFUSION_ENGINE_TIMING_FAMILIES) == 5
 
-    def test_vae_denoise_has_2_families(self) -> None:
-        assert len(_VAE_DENOISE_FAMILIES) == 2
+    def test_vae_denoise_has_3_families(self) -> None:
+        assert len(_VAE_DENOISE_FAMILIES) == 3
 
-    def test_total_16_new_families(self) -> None:
-        assert len(_NEW_FAMILIES) == 16
+    def test_total_19_new_families(self) -> None:
+        assert len(_NEW_FAMILIES) == 19
 
 
 class TestPrefix:

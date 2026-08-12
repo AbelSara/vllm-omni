@@ -47,15 +47,35 @@ issue 范围聚焦 image（text-to-image / image-to-image）服务层指标，�
 
 ### Tier 3 — 新 family，需补数据源
 
-3 个 family。本次 PR 注册 family 声明和 `OmniPrometheusMetrics` observe 方法。`requests_failed_total` 的 emit 调用点在本次 PR 内完成；`kv_wait_s` / `diffusion_forward_s` 因依赖外部 block rework，emit 调用留作 follow-up。
+3 个 family。全部落地（emit 已连线）。
 
-| Family | Type | Labels | 状态 | Blocker |
+| Family | Type | Labels | 状态 | 实现说明 |
 |---|---|---|---|---|
-| `vllm_omni:requests_failed_total` | Counter | `model_name, reason` | **本次 PR 落地**（emit 已连线） | `reason` taxonomy 已在本节末尾锁定；`omni_base.py` / `async_omni.py` 失败路径加 `inc_requests_failed(reason)` |
-| `vllm_omni:kv_wait_s` | Histogram | `model_name, connector_type` | follow-up | 依赖 KV manager block rework（记录 waiting 时间戳） |
-| `vllm_omni:diffusion_forward_s` | Histogram | `model_name, stage, replica` | follow-up | 需在 diffusion runner 内部加 sub-timer 拆 forward vs preprocess/postprocess/KV load；与 issue out-of-scope "需要 GPU sync 的测量" 边界冲突，需先评估 |
+| `vllm_omni:requests_failed_total` | Counter | `model_name, reason` | **落地**（emit 已连线） | `reason` taxonomy 已在本节末尾锁定；`omni_base.py` / `async_omni.py` 失败路径加 `inc_requests_failed(reason)` |
+| `vllm_omni:kv_wait_s` | Histogram | `model_name, connector_type` | **落地**（emit 已连线） | 见下方「kv_wait_s emit 实现细节」 |
+| `vllm_omni:diffusion_forward_s` | Histogram | `model_name, stage, replica` | **落地**（emit 已连线） | 见下方「diffusion_forward_s emit 实现细节」 |
 
 `requests_failed_total` 的 `reason` 取值见本节末尾 taxonomy；`omni_base.py:_fire_failure_counter_if_alive` / `_log_summary_and_cleanup` 接受 `reason` 参数，`async_omni.py` 在 `CancelledError` / `Exception` 分支分别传 `client_disconnect` / `stage_error`。
+
+#### kv_wait_s emit 实现细节
+
+原 blocker「需 KV manager block rework」经核实不成立——真问题是**进程边界**：`OmniARScheduler` 在 engine core 进程，`OmniPrometheusMetrics` 在 entrypoint 进程，等待 EXIT 时无 output 跨过 ZMQ。时间戳只需一个 `dict[str, float]` sidecar。
+
+- **ENTER**：`omni_ar_scheduler._free_request` 在两条进入 `waiting_for_transfer_free` 的路径（active-transfer wait / not-yet-triggered）记 `_kv_wait_start_ts[request_id] = time.monotonic()`
+- **EXIT**：`update_from_output` 处理 `kv_extracted_ids` 的 pre-process 循环（extraction ack 即等待结束时刻）调 `_emit_kv_wait_output`，pop start ts、算 `kv_wait_s = monotonic() - start`、resolve `connector_type`（`_resolve_kv_connector_type` 读 `omni_kv_config.connector_config["type"]`），append 一个轻量 `OmniEngineCoreOutput(..., kv_transfer_params={"kv_wait_s":..., "connector_type":...})`
+- **跨界 emit**：orchestrator `_orchestration_loop` 的 `for eco in raw_outputs.outputs` 循环（在 `async_chunk` 早返回之前，`_prom_metrics is not None` guard）读 `kv_transfer_params["kv_wait_s"]` 调 `observe_kv_wait(connector_type, kv_wait_s)`
+- **GPU sync**：无——ENTER/EXIT 都是纯 CPU set 操作，wait duration 是 `time.monotonic` delta，不撞 issue out-of-scope
+- **best-effort**：请求 abort 时若未走 `kv_extracted_ids` 路径，`_kv_wait_start_ts` 条目泄漏（量小，进程重启清空）；与 `waiting_for_transfer_free` 自身的生命周期一致
+- **`connector_type` 取值**：factory 注册全类名（`SharedMemoryConnector` / `MooncakeStoreConnector` / ...），定义在 `distributed/omni_connectors/factory.py:128-137`；未配置时 fallback `"unknown"`
+
+#### diffusion_forward_s emit 实现细节
+
+原 blocker「需 GPU sync，撞 issue out-of-scope」经核实为伪命题——`DiffusionPipelineProfiler`（`diffusion_pipeline_profiler.py:23-30`）已对每个 wrap 的调用前后做 `current_omni_platform.synchronize()`，而已经接好的 `vae_decode_s` 就是走这条 GPU-synced 的 `stage_durations`。forward 复用同一条路，不引入新 sync。
+
+- **取数**：复用 profiler 的 `*.diffuse` key（denoise 循环 = transformer forward + per-step scheduler over all timesteps；排除 preprocess / postprocess / VAE decode / KV load）。`diffusion_engine._extract_diffuse_ms`（镜像 `_extract_vae_decode_ms`）从 `DiffusionOutput.stage_durations` 求和 `endswith(".diffuse")` 的值
+- **emit 链路**：`step_streaming` 写 `forward_time_ms` → `OrchestratorAggregator._MS_TO_S` 映射 `forward_time_ms → forward_time_s` → `StageRequestStats.diffusion_metrics["forward_time_s"]` → `_observe_diffusion_finalize` dispatcher 调 `observe_diffusion_forward`
+- **profiler-gated**：profiler 关闭时 `stage_durations` 为空，`_extract_diffuse_ms` 返回 None，dispatcher 跳过该 key（无零样本）。与 `vae_decode_s` 同取舍
+- **路由修正**：原脚手架把 `diffusion_forward_s` 的 family + observe 挂在 `OmniPrometheusMetrics`，但 finalize dispatcher 只拿得到 `OmniModalityMetrics`。已整体迁到 `modality.py` 与 `diffusion_exec_s` / `vae_decode_s` 等兄弟 family 并排，走同一条 `_observe_diffusion_finalize` 通路
 
 ### issue #5811 配套约定
 
@@ -78,13 +98,15 @@ issue 范围聚焦 image（text-to-image / image-to-image）服务层指标，�
    - 构造顺序调整：`OmniPrometheusMetrics` 在 `AsyncOmniEngine` 之前构造并经 kwarg 透传
 6. `vllm_omni/entrypoints/async_omni.py` — `AsyncOmniEngine.__init__` 加 `prom_metrics` 参数；`_run_orchestrator` 透传给 `Orchestrator`；`CancelledError` / `Exception` 失败分支分别传 `client_disconnect` / `stage_error`
 7. `vllm_omni/engine/orchestrator.py` — `Orchestrator.__init__` 加 `prom_metrics` 参数；`_orchestration_loop` 在 `_stat_logger.record()` 后从 `raw_outputs.scheduler_stats.num_waiting_reqs` 调 `set_stage_waiting_requests`
-8. `tests/metrics/test_definitions.py` — 锁定 10 个 family 常量、label set 形状、Counter 后缀、唯一性
+8. `tests/metrics/test_definitions.py` — 锁定 16 个 family 常量（7 stage-service + 3 failure/kv/forward + 4 diffusion-engine-timing + 2 vae/denoise）、label set 形状、Counter 后缀、唯一性
 9. `tests/metrics/test_emit_calls.py` — 验证 emit 调用点接线（mock `OmniPrometheusMetrics`，断言 `observe_*` / `inc_*` / `set_*` 在预期路径被调用）
 
-### Tier 3 follow-up（不在本次 PR 范围）
+### Tier 3 follow-up
 
-- `kv_wait_s` — 依赖 KV manager block rework；当前 KV 等待路径无时间戳记录
-- `diffusion_forward_s` — 需在 diffusion runner 内部加 sub-timer 拆 forward vs preprocess/postprocess/KV load；且 forward-only 计时需要 GPU sync，与 issue out-of-scope "需要 GPU sync 的测量" 边界冲突，需先评估
+`kv_wait_s` 和 `diffusion_forward_s` 原列 follow-up，经核实两个 blocker 均不成立，已在本次 PR 落地（见上方「kv_wait_s emit 实现细节」「diffusion_forward_s emit 实现细节」）。剩余 follow-up 仅限：
+
+- `kv_wait_s` 的 **abort 路径兜底**——请求 abort 时未走 `kv_extracted_ids`，`_kv_wait_start_ts` 条目泄漏。当前 best-effort（量小、进程重启清空），与 `waiting_for_transfer_free` 自身生命周期一致；如需严格不泄漏，在强制清理 `waiting_for_transfer_free` 的 abort 路径同步 pop（但不发 metric，等待被打断无意义）
+- `diffusion_forward_s` 的 **纯 transformer forward**（排除 per-step scheduler step）——当前 `*.diffuse` key 含 per-step scheduler（很轻，通常可忽略）；若将来要纯 forward，需在 `predict_noise` / `current_model(...)` 层面 wrap per-step target。本次不做
 
 ---
 
@@ -150,11 +172,17 @@ Bucket 选择：
 ### 与 issue #5811 `diffusion_forward_s` 的关系
 
 两者不重叠：
-- `diffusion_forward_s`（issue #5811 Tier 3，follow-up）— forward-only 计时
-  （排除 preprocess/postprocess/KV load），需在 diffusion runner 内部加
-  sub-timer 拆分；与 issue out-of-scope "GPU sync 测量" 边界冲突，需评估
+- `diffusion_forward_s`（issue #5811 Tier 3，**已落地**）— forward-only 计时
+  （denoise 循环 = transformer forward + per-step scheduler，排除
+  preprocess/postprocess/VAE decode/KV load）。复用 profiler `*.diffuse` key，
+  GPU sync 已由 profiler 付掉（与 `vae_decode_s` 同机制），不引入新 sync。
+  经 `modality.py` 的 `_observe_diffusion_finalize` 路由（family + observe
+  已从 `prometheus.py` 迁来与兄弟 family 并排）
 - `diffusion_exec_s`（PR #4755）— E2E 引擎执行计时（含 forward，不含
   preprocess/postprocess），数据已在 `step_streaming` emit 中
+
+两者区别：`diffusion_exec_s` 含 KV load + scheduler busy-loop + VAE decode +
+D2H（折进 `exec_total_time`），`diffusion_forward_s` 只含 denoise 循环本身。
 
 ### PR #4755 落地动作清单（本次 PR 已完成）
 
