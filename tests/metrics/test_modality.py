@@ -714,10 +714,10 @@ class TestObserveDiffusionFinalize:
 
     def test_diffusion_total_time_key_not_observed(self):
         # Engine still emits diffusion_engine_total_time_ms (pinned by
-        # test_diffusion_engine_metrics.py); the accumulator converts it to
-        # ``_s`` for symmetry but the dispatcher must NOT route it to any
-        # Prometheus family — exec / preprocess / postprocess already cover
-        # the timing surface.
+        # test_diffusion_engine_metrics.py); the accumulator drops it via
+        # _UNUSED_DIFFUSION_KEYS. A stale ``_s`` key in the dict must still
+        # NOT be routed by the dispatcher — exec / preprocess / postprocess
+        # already cover the timing surface.
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,

@@ -685,8 +685,7 @@ class OmniBase(PDDisaggregationMixin):
                     self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
                 if _m is not None and _m.pipeline_timings:
                     _qw_ms = float(_m.pipeline_timings.get("queue_wait_ms", 0.0) or 0.0)
-                    if _qw_ms > 0:
-                        self.prom_metrics.observe_queue_wait(_qw_ms / 1000.0)
+                    self.prom_metrics.observe_queue_wait(_qw_ms / 1000.0)
 
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
