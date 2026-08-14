@@ -128,7 +128,8 @@ _diffusion_kv_load_family = Histogram(
 )
 _image_ttfp_family = Histogram(
     defs.IMAGE_TTFP_S,
-    "Image time-to-first-output in seconds (request arrival → first image materialized; non-streaming single-image).",
+    "Image time-to-first-output in seconds (stage submit → first image materialized; non-streaming single-image). "
+    "Stage-level, not e2e — excludes API queue and inter-stage transfer before the image stage.",
     labelnames=_stage_labels,
     buckets=defs.SECONDS_BUCKETS,
 )
