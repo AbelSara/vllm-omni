@@ -1061,7 +1061,6 @@ class Orchestrator:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-                    request_timestamp=req_state.request_timestamp,
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
