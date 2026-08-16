@@ -100,8 +100,16 @@ class TestMetricKeys:
                 raise AssertionError("diffusion_engine_total_time_ms should be attached in step_streaming()")
 
         assert '"diffusion_engine_exec_time_ms": exec_total_time * 1000' in step_streaming_source
-        assert '"diffusion_engine_total_time_ms": step_total_ms' in step_streaming_source
+        # step_total_ms is no longer emitted as a metric (no family consumes
+        # it); it lives only in the debug log breakdown below.
+        assert '"diffusion_engine_total_time_ms"' not in step_streaming_source
         assert '"postprocess_time_ms": postprocess_time * 1000' in step_streaming_source
+
+    def test_step_streaming_piggybacks_scheduler_waiting_snapshot(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
+        assert "DIFFUSION_SCHEDULER_WAITING_KEY" in step_streaming_source
+        assert "_scheduler_num_waiting_reqs" in step_streaming_source
 
 
 class TestVaeDecodeEmit:

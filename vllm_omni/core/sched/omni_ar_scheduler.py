@@ -154,6 +154,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
         )
 
+    def _clear_kv_wait_starts(self, request_ids: Iterable[str]) -> None:
+        """Drop incomplete KV-wait measurements for terminal requests."""
+        for request_id in request_ids:
+            self._kv_wait_start_ts.pop(request_id, None)
+
+    def finish_requests(
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+    ) -> list[Request]:
+        """Finish requests and discard any incomplete KV-wait timing."""
+        if isinstance(request_ids, str):
+            cleanup_ids = (request_ids,)
+            finish_request_ids: str | tuple[str, ...] | None = request_ids
+        elif request_ids is None:
+            cleanup_ids = ()
+            finish_request_ids = None
+        else:
+            cleanup_ids = tuple(request_ids)
+            finish_request_ids = cleanup_ids
+
+        finished = super().finish_requests(finish_request_ids, finished_status)
+        self._clear_kv_wait_starts(cleanup_ids)
+        return finished
+
     def _get_kv_transfer_criteria(self) -> dict | None:
         return self._get_omni_kv_config_value("kv_transfer_criteria")
 

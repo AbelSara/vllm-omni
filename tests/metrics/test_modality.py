@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from prometheus_client import REGISTRY, generate_latest
 
@@ -10,6 +12,7 @@ from vllm_omni.metrics.modality import (
     observe_audio_streaming_finalize,
     observe_modality_at_finalize,
 )
+from vllm_omni.metrics.stats import OrchestratorAggregator
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -447,6 +450,37 @@ class TestObserveModalityAtFinalize:
         assert stub.calls == []
 
 
+class TestDiffusionUnitConversion:
+    def test_accumulator_converts_all_engine_milliseconds_to_seconds(self):
+        aggregator = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=0.0,
+            final_stage_id_for_e2e=0,
+        )
+        engine_output = SimpleNamespace(
+            metrics={
+                "preprocess_time_ms": 50.0,
+                "diffusion_engine_exec_time_ms": 1500.0,
+                "postprocess_time_ms": 20.0,
+                "vae_decode_time_ms": 300.0,
+                "forward_time_ms": 800.0,
+                "kv_recv_time_ms": 40.0,
+            }
+        )
+
+        aggregator.accumulate_diffusion_metrics("diffusion", "req-units", engine_output)
+
+        assert dict(aggregator.diffusion_metrics["req-units"]) == {
+            "preprocess_time_s": pytest.approx(0.05),
+            "diffusion_engine_exec_time_s": pytest.approx(1.5),
+            "postprocess_time_s": pytest.approx(0.02),
+            "vae_decode_time_s": pytest.approx(0.3),
+            "forward_time_s": pytest.approx(0.8),
+            "kv_recv_time_s": pytest.approx(0.04),
+        }
+
+
 class TestObserveDiffusionFinalize:
     def test_diffusion_path_emits_all_four_families(self):
         stub = _StubModMetrics()
@@ -713,11 +747,6 @@ class TestObserveDiffusionFinalize:
         assert stub.calls == []
 
     def test_diffusion_total_time_key_not_observed(self):
-        # Engine still emits diffusion_engine_total_time_ms (pinned by
-        # test_diffusion_engine_metrics.py); the accumulator drops it via
-        # _UNUSED_DIFFUSION_KEYS. A stale ``_s`` key in the dict must still
-        # NOT be routed by the dispatcher — exec / preprocess / postprocess
-        # already cover the timing surface.
         stub = _StubModMetrics()
         observe_modality_at_finalize(
             stub,

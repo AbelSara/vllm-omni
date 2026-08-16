@@ -641,9 +641,6 @@ class OrchestratorAggregator:
         "forward_time_ms": "forward_time_s",
         "kv_recv_time_ms": "kv_recv_time_s",
     }
-    # Engine emits these timing keys but no Prometheus family consumes them;
-    # skip accumulation so they don't surface in the log table as truncated ints.
-    _UNUSED_DIFFUSION_KEYS: frozenset[str] = frozenset({"diffusion_engine_total_time_ms"})
 
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
         """Accumulate diffusion metrics for a request.
@@ -672,7 +669,7 @@ class OrchestratorAggregator:
                 continue
             if key in self._MS_TO_S:
                 bucket[self._MS_TO_S[key]] += float(value) / 1000.0
-            elif key not in self._UNUSED_DIFFUSION_KEYS:
+            else:
                 bucket[key] += float(value)
 
     def on_forward(

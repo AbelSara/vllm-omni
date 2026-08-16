@@ -61,6 +61,7 @@ IMAGE_COUNT = "image_count"
 IMAGE_GENERATION = "image_generation"
 IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
 IMAGE_PIXELS = "image_pixels"
+DIFFUSION_SCHEDULER_WAITING_KEY = "scheduler_num_waiting_reqs"
 TOTAL_IMAGES = "total_images"
 IMAGE_THROUGHPUT = "image_throughput"
 AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
@@ -187,7 +188,7 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 # ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
 
-STAGE_GEN_TIME_LABELS = ("model_name", "stage")
+STAGE_GEN_TIME_LABELS = ("model_name", "stage", "stage_type")
 DIFFUSION_LABELS = ("model_name", "stage")
 FAILED_LABELS = ("model_name", "reason")
 KV_WAIT_LABELS = ("model_name", "connector_type")

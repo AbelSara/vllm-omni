@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
@@ -26,7 +26,7 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_st
 from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
-from vllm_omni.metrics.stats import OrchestratorAggregator
+from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -36,6 +36,44 @@ if TYPE_CHECKING:
     from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
+
+_FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
+
+
+def _normalize_failure_reason(reason: str | None) -> str | None:
+    return reason if reason in _FAILURE_REASONS else "unknown"
+
+
+def _extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
+    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
+        return None
+    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def _calculate_stage_in_queue_s(
+    *,
+    stage_gen_time_ms: float,
+    diffusion_exec_s: float | None,
+    postprocess_s: float | None,
+) -> float | None:
+    if diffusion_exec_s is None:
+        return None
+    wait_s = stage_gen_time_ms / 1000.0 - float(diffusion_exec_s) - float(postprocess_s or 0.0)
+    return max(wait_s, 0.0)
+
+
+def _observe_stage_workload_metrics(
+    prom_metrics: OmniPrometheusMetrics,
+    *,
+    stage_type: str,
+    stage_metrics: StageRequestStats,
+) -> None:
+    if stage_type == "diffusion":
+        prom_metrics.observe_num_inference_steps(stage_metrics.num_inference_steps)
+
+    if stage_metrics.output_unit_type == "image":
+        prom_metrics.observe_image_pixels(stage_metrics.image_pixels)
+        prom_metrics.inc_image_count(stage_metrics.output_unit_count)
 
 
 class OmniEngineDeadError(EngineDeadError):
@@ -342,22 +380,20 @@ class OmniBase(PDDisaggregationMixin):
             raise ValueError(f"Expected {self.num_stages} sampling params, got {len(normalized)}")
         return normalized
 
-    def _fire_failure_counter_if_alive(self, request_id: str, reason: str = "stage_error") -> None:
-        """Fire the abort/exception bucket of requests_success_total.
-
-        Called from cancel / exception paths in async_omni.generate() BEFORE
-        _abort_internal_requests pops request_states — that method resolves
-        the internal id by dict lookup, so popping first would no-op it. We
-        keep this counter fire separate from _log_summary_and_cleanup (which
-        pops) so the abort path can still find the state to clean up.
-        """
+    def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
         if req_state is None or req_state.metrics is None or prom is None:
             return
-        if str(request_id) not in req_state.metrics.e2e_done:
-            prom.request_failed()
-            prom.inc_requests_failed(reason)
+        if str(request_id) in req_state.metrics.e2e_done or getattr(req_state, "failure_recorded", False):
+            return
+
+        req_state.failure_recorded = True
+        prom.request_failed()
+        prom.inc_requests_failed(_normalize_failure_reason(reason))
+
+    def _fire_failure_counter_if_alive(self, request_id: str, reason: str = "stage_error") -> None:
+        self._record_request_failure_once(request_id, reason)
 
     def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
@@ -365,8 +401,7 @@ class OmniBase(PDDisaggregationMixin):
             if req_state is None or req_state.metrics is None:
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
-                self.prom_metrics.request_failed()
-                self.prom_metrics.inc_requests_failed(reason)
+                self._record_request_failure_once(request_id, reason)
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
@@ -583,17 +618,28 @@ class OmniBase(PDDisaggregationMixin):
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
-                self.prom_metrics.observe_stage_gen_time(stage_id, _m.stage_gen_time_ms / 1000.0)
-                self.prom_metrics.observe_image_pixels(_m.image_pixels)
-                self.prom_metrics.observe_num_inference_steps(_m.num_inference_steps)
-                # In-stage pool wait ≈ stage_gen_time minus diffusion engine exec.
+                if peak_memory_mb > 0:
+                    self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
+                self.prom_metrics.observe_stage_gen_time(
+                    stage_id,
+                    stage_meta.stage_type,
+                    _m.stage_gen_time_ms / 1000.0,
+                )
+                _observe_stage_workload_metrics(
+                    self.prom_metrics,
+                    stage_type=stage_meta.stage_type,
+                    stage_metrics=_m,
+                )
                 # Only meaningful for diffusion stages (text stages have no exec key).
                 _diff_m = _m.diffusion_metrics or {}
-                _exec_s = _diff_m.get("diffusion_engine_exec_time_s")
-                if _exec_s is not None:
-                    self.prom_metrics.observe_stage_in_queue(stage_id, _m.stage_gen_time_ms / 1000.0 - float(_exec_s))
+                stage_in_queue_s = _calculate_stage_in_queue_s(
+                    stage_gen_time_ms=_m.stage_gen_time_ms,
+                    diffusion_exec_s=_diff_m.get("diffusion_engine_exec_time_s"),
+                    postprocess_s=_diff_m.get("postprocess_time_s"),
+                )
+                if stage_in_queue_s is not None:
+                    self.prom_metrics.observe_stage_in_queue(stage_id, stage_in_queue_s)
                 if _m.output_unit_type == "image":
-                    self.prom_metrics.inc_image_count(_m.output_unit_count)
                     if result.replica_id is not None:
                         self.mod_metrics.observe_denoise_step_latency(
                             str(stage_id),
@@ -638,11 +684,9 @@ class OmniBase(PDDisaggregationMixin):
                     _gen_tok += int(evt.num_tokens_out)
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
 
-                if peak_memory_mb:
-                    self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
-                if _m is not None and _m.pipeline_timings:
-                    _qw_ms = float(_m.pipeline_timings.get("queue_wait_ms", 0.0) or 0.0)
-                    self.prom_metrics.observe_queue_wait(_qw_ms / 1000.0)
+                queue_wait_s = _extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
+                if queue_wait_s is not None:
+                    self.prom_metrics.observe_queue_wait(queue_wait_s)
 
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
