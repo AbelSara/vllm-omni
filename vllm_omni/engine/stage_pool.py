@@ -611,7 +611,6 @@ class StagePool:
         request_outputs: list[Any],
         *,
         submit_ts: float,
-        request_timestamp: float,
         replica_id: int,
         sampling_params: Any | None = None,
     ) -> StageRequestMetrics:
@@ -661,9 +660,7 @@ class StagePool:
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
-            max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
-            if non_empty_first_output_ts is not None
-            else 0.0
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0) if non_empty_first_output_ts is not None else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
         if output_unit_count > 1 and self._is_streaming_output_unit_type(output_unit_type):
