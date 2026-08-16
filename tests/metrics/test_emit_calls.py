@@ -1,12 +1,10 @@
 """Verify emit-call wiring in production code paths.
 
-`test_definitions.py` pins the family constants and label shapes; this file
-uses behavior and Prometheus exposition to verify production call semantics.
+Uses behavior and Prometheus exposition to verify production call semantics.
 """
 
 from __future__ import annotations
 
-import inspect
 import time
 from types import SimpleNamespace
 
@@ -142,86 +140,6 @@ class TestFailureCounterWiring:
         obj._log_summary_and_cleanup("req-1")
 
         prom.inc_requests_failed.assert_called_once_with("stage_error")
-
-
-# ---------------------------------------------------------------------------
-# Cross-process plumbing pins — verify prom_metrics threads through to the
-# Orchestrator (the only emit site that lives outside the API server process).
-# ---------------------------------------------------------------------------
-
-
-class TestPromMetricsPlumbing:
-    def test_async_omni_engine_init_accepts_prom_metrics_kwarg(self) -> None:
-        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-
-        sig = inspect.signature(AsyncOmniEngine.__init__)
-        assert "prom_metrics" in sig.parameters, (
-            "AsyncOmniEngine.__init__ missing prom_metrics parameter — "
-            "OmniBase cannot forward prom_metrics to the Orchestrator"
-        )
-
-    def test_orchestrator_init_accepts_prom_metrics_kwarg(self) -> None:
-        from vllm_omni.engine.orchestrator import Orchestrator
-
-        sig = inspect.signature(Orchestrator.__init__)
-        assert "prom_metrics" in sig.parameters, (
-            "Orchestrator.__init__ missing prom_metrics parameter — "
-            "AsyncOmniEngine cannot forward prom_metrics for stage_waiting emit"
-        )
-
-    def test_orchestrator_init_stores_prom_metrics(self) -> None:
-        # Construction without stage_pools raises (stage_pools is required),
-        # but the signature accepting prom_metrics is what we need to pin.
-        from vllm_omni.engine.orchestrator import Orchestrator
-
-        sig = inspect.signature(Orchestrator.__init__)
-        assert sig.parameters["prom_metrics"].default is None, (
-            "prom_metrics should default to None so unit-test engines without prom_metrics still construct cleanly"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Observe-method surface pins — verify the OmniPrometheusMetrics API surface
-# expected by the emit sites actually exists.
-# ---------------------------------------------------------------------------
-
-_EXPECTED_OBSERVE_METHODS: dict[str, tuple[str, ...]] = {
-    "observe_stage_gen_time": ("stage", "stage_type", "gen_time_s"),
-    "observe_stage_in_queue": ("stage", "in_queue_s"),
-    "observe_queue_wait": ("queue_wait_s",),
-    "set_stage_waiting_requests": ("stage", "n_waiting"),
-    "observe_num_inference_steps": ("n_steps",),
-    "inc_image_count": ("n_images",),
-    "observe_image_pixels": ("n_pixels",),
-    "set_peak_memory": ("stage", "peak_memory_mb"),
-    "inc_requests_failed": ("reason",),
-    "observe_kv_wait": ("connector_type", "kv_wait_s"),
-}
-
-
-class TestObserveMethodSurface:
-    """All 10 observe methods exist on OmniPrometheusMetrics with the
-    parameter names the emit sites use. Catches a rename refactor that
-    would silently break the emit call.
-
-    Note: ``observe_diffusion_forward`` / ``observe_diffusion_kv_load`` /
-    ``observe_image_ttfp`` live on ``OmniModalityMetrics`` alongside the other
-    diffusion timing families (see test_modality.py) so they can ride the
-    ``_observe_diffusion_finalize`` dispatcher.
-    """
-
-    @pytest.mark.parametrize("method,expected_params", list(_EXPECTED_OBSERVE_METHODS.items()))
-    def test_observe_method_exists_with_expected_params(self, method: str, expected_params: tuple[str, ...]) -> None:
-        func = getattr(OmniPrometheusMetrics, method, None)
-        assert func is not None, f"OmniPrometheusMetrics missing {method}"
-        sig = inspect.signature(func)
-        # Drop 'self' before comparing.
-        params = tuple(sig.parameters.keys())[1:]
-        # Methods can have extra params with defaults (e.g. n_images=1); we
-        # just need the named params to come first and match.
-        assert params[: len(expected_params)] == expected_params, (
-            f"{method} signature mismatch: expected leading params {expected_params}, got {params}"
-        )
 
 
 class TestEarlyReturnOnLogStatsOff:

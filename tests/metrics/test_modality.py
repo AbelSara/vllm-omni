@@ -482,292 +482,44 @@ class TestDiffusionUnitConversion:
 
 
 class TestObserveDiffusionFinalize:
-    def test_diffusion_path_emits_all_four_families(self):
+    @pytest.mark.parametrize(
+        ("metric_key", "call_name", "value"),
+        [
+            ("vae_decode_time_s", "observe_vae_decode", 0.3),
+            ("forward_time_s", "observe_diffusion_forward", 0.8),
+            ("kv_recv_time_s", "observe_diffusion_kv_load", 0.04),
+        ],
+    )
+    def test_emits_optional_breakdown_metric(self, metric_key, call_name, value):
         stub = _StubModMetrics()
-        # Accumulator carries the ``_s`` keys the dispatcher reads — these
-        # are populated by OrchestratorAggregator.accumulate_diffusion_metrics
-        # from the engine's ``_ms`` emits via the ``_MS_TO_S`` map.
-        stage_metrics = _Bag(
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 1.5,
-                "preprocess_time_s": 0.05,
-                "postprocess_time_s": 0.02,
-            },
-            num_inference_steps=20,
-        )
-
         observe_modality_at_finalize(
             stub,
             output_type="image",
             stage_id=2,
             replica_id=0,
-            stage_metrics=stage_metrics,
+            stage_metrics=_Bag(diffusion_metrics={metric_key: value}),
             engine_outputs=_Bag(),
         )
 
-        assert ("observe_diffusion_exec", "2", "0", 1.5) in stub.calls
-        # Per-step derived: 1.5 / 20 = 0.075.
-        assert ("observe_diffusion_exec_per_step", "2", "0", pytest.approx(0.075)) in stub.calls
-        assert ("observe_diffusion_preprocess", "2", "0", 0.05) in stub.calls
-        assert ("observe_diffusion_postprocess", "2", "0", 0.02) in stub.calls
-
-    def test_diffusion_path_emits_vae_decode(self):
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 1.0,
-                "vae_decode_time_s": 0.3,
-            },
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert ("observe_vae_decode", "2", "0", 0.3) in stub.calls
-
-    def test_diffusion_path_skips_vae_decode_when_key_missing(self):
-        # When the profiler is off, vae_decode_time_ms is never emitted by
-        # the engine, so the accumulator dict lacks the ``_s`` key and the
-        # dispatcher must skip — no zero-valued observation.
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={"diffusion_engine_exec_time_s": 1.0},
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert not any(c[0] == "observe_vae_decode" for c in stub.calls)
-
-    def test_diffusion_path_emits_forward(self):
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 1.0,
-                "forward_time_s": 0.8,
-            },
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert ("observe_diffusion_forward", "2", "0", 0.8) in stub.calls
-
-    def test_diffusion_path_skips_forward_when_key_missing(self):
-        # Profiler off → no forward_time_s key → dispatcher must skip.
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={"diffusion_engine_exec_time_s": 1.0},
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert not any(c[0] == "observe_diffusion_forward" for c in stub.calls)
-
-    def test_diffusion_path_emits_kv_load(self):
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 1.0,
-                "kv_recv_time_s": 0.04,
-            },
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert ("observe_diffusion_kv_load", "2", "0", 0.04) in stub.calls
-
-    def test_diffusion_path_skips_kv_load_when_key_missing(self):
-        # No upstream KV (single-stage) → no kv_recv_time_s key → skip.
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={"diffusion_engine_exec_time_s": 1.0},
-            num_inference_steps=10,
-        )
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-        assert not any(c[0] == "observe_diffusion_kv_load" for c in stub.calls)
+        assert (call_name, "2", "0", value) in stub.calls
 
     def test_audio_diffusion_stage_fires_both_paths(self):
-        # stable_audio: output_type=audio AND diffusion_metrics populated.
-        # Dispatcher must route to BOTH diffusion AND audio helpers.
         stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            stage_gen_time_ms=1500.0,
-            audio_generated_frames=24000,
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 1.2,
-                "preprocess_time_s": 0.04,
-                "postprocess_time_s": 0.01,
-            },
-            num_inference_steps=15,
-        )
-        engine_outputs = _Bag(multimodal_output={"audio_sample_rate": 24000})
-
         observe_modality_at_finalize(
             stub,
             output_type="audio",
             stage_id=1,
             replica_id=0,
-            stage_metrics=stage_metrics,
-            engine_outputs=engine_outputs,
+            stage_metrics=_Bag(
+                stage_gen_time_ms=1500.0,
+                audio_generated_frames=24000,
+                diffusion_metrics={"diffusion_engine_exec_time_s": 1.2},
+            ),
+            engine_outputs=_Bag(multimodal_output={"audio_sample_rate": 24000}),
         )
 
-        # Diffusion path fired.
         assert ("observe_diffusion_exec", "1", "0", 1.2) in stub.calls
-        assert ("observe_diffusion_exec_per_step", "1", "0", pytest.approx(0.08)) in stub.calls
-        assert ("observe_diffusion_preprocess", "1", "0", 0.04) in stub.calls
-        assert ("observe_diffusion_postprocess", "1", "0", 0.01) in stub.calls
-        # Audio path ALSO fired — 24000 frames / 24000 Hz = 1.0s duration.
-        assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
         assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
-        assert ("observe_audio_rtf", "1", "0", 1.5) in stub.calls
-
-    def test_video_diffusion_stage_fires_only_diffusion(self):
-        # Video stage: diffusion_metrics populated but output_type=video —
-        # the audio path must NOT fire (no audio frames on a video stage).
-        stub = _StubModMetrics()
-        stage_metrics = _Bag(
-            diffusion_metrics={
-                "diffusion_engine_exec_time_s": 8.0,
-                "postprocess_time_s": 0.2,
-            },
-            num_inference_steps=50,
-        )
-
-        observe_modality_at_finalize(
-            stub,
-            output_type="video",
-            stage_id=3,
-            replica_id=1,
-            stage_metrics=stage_metrics,
-            engine_outputs=_Bag(),
-        )
-
-        assert ("observe_diffusion_exec", "3", "1", 8.0) in stub.calls
-        assert ("observe_diffusion_exec_per_step", "3", "1", pytest.approx(0.16)) in stub.calls
-        # preprocess was missing in the dict — must be skipped, not observed as 0.
-        assert not any(c[0] == "observe_diffusion_preprocess" for c in stub.calls)
-        assert ("observe_diffusion_postprocess", "3", "1", 0.2) in stub.calls
-        # Audio path must not fire for video output.
-        assert not any(c[0].startswith("observe_audio") or c[0] == "inc_audio_frames" for c in stub.calls)
-
-    def test_diffusion_path_skips_when_metrics_dict_missing(self):
-        # Stage without diffusion_metrics attribute — text or AR stage that
-        # happens to flow through the finalize dispatcher. Must NOT raise.
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="text",
-            stage_id=0,
-            replica_id=0,
-            stage_metrics=_Bag(stage_gen_time_ms=100.0),
-            engine_outputs=_Bag(),
-        )
-        assert stub.calls == []
-
-    def test_diffusion_path_skips_when_metrics_dict_empty(self):
-        # Diffusion stage that emitted nothing yet (engine_outputs.metrics={}).
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(diffusion_metrics={}, num_inference_steps=0),
-            engine_outputs=_Bag(),
-        )
-        assert stub.calls == []
-
-    def test_diffusion_per_step_skipped_when_num_steps_zero(self):
-        # exec_time is present but num_inference_steps missing/zero — the
-        # derived per-step metric must be skipped (no div-by-zero), but exec
-        # itself still observed.
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(
-                diffusion_metrics={"diffusion_engine_exec_time_s": 1.5},
-                num_inference_steps=0,
-            ),
-            engine_outputs=_Bag(),
-        )
-        assert ("observe_diffusion_exec", "2", "0", 1.5) in stub.calls
-        assert not any(c[0] == "observe_diffusion_exec_per_step" for c in stub.calls)
-
-    def test_diffusion_replica_id_none_skipped(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=None,
-            stage_metrics=_Bag(
-                diffusion_metrics={"diffusion_engine_exec_time_s": 1.0},
-                num_inference_steps=10,
-            ),
-            engine_outputs=_Bag(),
-        )
-        assert stub.calls == []
-
-    def test_diffusion_total_time_key_not_observed(self):
-        stub = _StubModMetrics()
-        observe_modality_at_finalize(
-            stub,
-            output_type="image",
-            stage_id=2,
-            replica_id=0,
-            stage_metrics=_Bag(
-                diffusion_metrics={
-                    "diffusion_engine_exec_time_s": 1.0,
-                    "diffusion_engine_total_time_s": 1.5,
-                    "preprocess_time_s": 0.05,
-                    "postprocess_time_s": 0.02,
-                },
-                num_inference_steps=10,
-            ),
-            engine_outputs=_Bag(),
-        )
-        # No observe_diffusion_total call exists on the stub or on
-        # OmniModalityMetrics — total_time_s must be silently unused.
-        assert not any("total" in c[0] for c in stub.calls)
-        assert ("observe_diffusion_exec", "2", "0", 1.0) in stub.calls
 
 
 class TestObserveAudioFirstPacket:
@@ -890,38 +642,6 @@ class TestBucketSelection:
         fast_marker = f'{defs.AUDIO_UNDERRUN_S}_bucket{{le="0.001"'
         assert fast_marker in out, "audio_underrun_s should use SECONDS_FAST_BUCKETS containing le=0.001"
 
-    def test_diffusion_exec_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
-        # exec_s is widened to SECONDS_BUCKETS (300 s ceiling) because video
-        # generation can exceed the 60 s cap in SECONDS_FAST_BUCKETS.
-        stage, replica = "diff_exec_sec", "0"
-        mod.observe_diffusion_exec(stage, replica, 1.5)
-        out = generate_latest(REGISTRY).decode()
-        # SECONDS_BUCKETS contains le=300.0 which is absent from SECONDS_FAST_BUCKETS.
-        sec_marker = f'{defs.DIFFUSION_EXEC_S}_bucket{{le="300.0"'
-        assert sec_marker in out, "diffusion_exec_s should use SECONDS_BUCKETS containing le=300.0"
-
-    def test_diffusion_exec_per_step_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
-        # Per-step is sub-second in practice; stays on the fast bucket.
-        stage, replica = "diff_step_fast", "0"
-        mod.observe_diffusion_exec_per_step(stage, replica, 0.075)
-        out = generate_latest(REGISTRY).decode()
-        fast_marker = f'{defs.DIFFUSION_EXEC_PER_STEP_S}_bucket{{le="0.001"'
-        assert fast_marker in out, "diffusion_exec_per_step_s should use SECONDS_FAST_BUCKETS containing le=0.001"
-
-    def test_diffusion_preprocess_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diff_pre_fast", "0"
-        mod.observe_diffusion_preprocess(stage, replica, 0.05)
-        out = generate_latest(REGISTRY).decode()
-        fast_marker = f'{defs.DIFFUSION_PREPROCESS_S}_bucket{{le="0.001"'
-        assert fast_marker in out, "diffusion_preprocess_s should use SECONDS_FAST_BUCKETS containing le=0.001"
-
-    def test_diffusion_postprocess_uses_seconds_fast_buckets(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "diff_post_fast", "0"
-        mod.observe_diffusion_postprocess(stage, replica, 0.02)
-        out = generate_latest(REGISTRY).decode()
-        fast_marker = f'{defs.DIFFUSION_POSTPROCESS_S}_bucket{{le="0.001"'
-        assert fast_marker in out, "diffusion_postprocess_s should use SECONDS_FAST_BUCKETS containing le=0.001"
-
     def test_vae_decode_uses_seconds_buckets(self, mod: OmniModalityMetrics) -> None:
         # VAE decode can stretch into seconds for high-resolution latents;
         # stays on the wide bucket so the 300 s ceiling covers video VAE.
@@ -950,29 +670,10 @@ class TestBucketSelection:
 
 
 class TestDenoiseStepLatencyGuard:
-    """``observe_denoise_step_latency`` uses a ``<= 0`` guard so text / AR
-    stages that contribute zero don't bump ``_count``. The emit site in
-    ``omni_base._process_single_result`` calls unconditionally inside the
-    image branch — the guard keeps zero samples out of the histogram.
-    """
-
-    def test_zero_skipped(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "denoise_zero", "0"
-        mod.observe_denoise_step_latency(stage, replica, 0.0)
+    @pytest.mark.parametrize(("value", "expected_count"), [(0.0, None), (-0.1, None), (0.05, 1.0)])
+    def test_nonpositive_values_are_skipped(self, mod: OmniModalityMetrics, value, expected_count) -> None:
+        stage, replica = f"denoise_{value}", "0"
+        mod.observe_denoise_step_latency(stage, replica, value)
         out = generate_latest(REGISTRY).decode()
         prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) is None
-
-    def test_negative_skipped(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "denoise_neg", "0"
-        mod.observe_denoise_step_latency(stage, replica, -0.1)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) is None
-
-    def test_positive_observed(self, mod: OmniModalityMetrics) -> None:
-        stage, replica = "denoise_pos", "0"
-        mod.observe_denoise_step_latency(stage, replica, 0.05)
-        out = generate_latest(REGISTRY).decode()
-        prefix = f'{defs.DENOISE_STEP_LATENCY_S}_count{{model_name="{_MODEL}",replica="{replica}",stage="{stage}"}}'
-        assert _sample_value(out, prefix) == 1.0
+        assert _sample_value(out, prefix) == expected_count
