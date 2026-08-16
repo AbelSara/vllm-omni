@@ -135,7 +135,7 @@ _image_ttfp_family = Histogram(
 )
 _denoise_step_latency_family = Histogram(
     defs.DENOISE_STEP_LATENCY_S,
-    "Mean per-step denoise latency in seconds (stage_gen_time / num_inference_steps).",
+    "Mean per-step denoise forward latency in seconds (forward_time / num_inference_steps).",
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
@@ -381,6 +381,11 @@ def _observe_diffusion_finalize(
     forward_s = diff_metrics.get(_DIFFUSION_FORWARD_KEY)
     if forward_s is not None:
         mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0 and getattr(stage_metrics, "output_unit_type", None) == "image":
+            mod_metrics.observe_denoise_step_latency(stage_label, replica_label, float(forward_s) / num_steps)
 
     kv_load_s = diff_metrics.get(_DIFFUSION_KV_LOAD_KEY)
     if kv_load_s is not None:

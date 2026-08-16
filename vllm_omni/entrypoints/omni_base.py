@@ -50,18 +50,6 @@ def _extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float
     return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
 
 
-def _calculate_stage_in_queue_s(
-    *,
-    stage_gen_time_ms: float,
-    diffusion_exec_s: float | None,
-    postprocess_s: float | None,
-) -> float | None:
-    if diffusion_exec_s is None:
-        return None
-    wait_s = stage_gen_time_ms / 1000.0 - float(diffusion_exec_s) - float(postprocess_s or 0.0)
-    return max(wait_s, 0.0)
-
-
 def _observe_stage_workload_metrics(
     prom_metrics: OmniPrometheusMetrics,
     *,
@@ -632,20 +620,11 @@ class OmniBase(PDDisaggregationMixin):
                 )
                 # Only meaningful for diffusion stages (text stages have no exec key).
                 _diff_m = _m.diffusion_metrics or {}
-                stage_in_queue_s = _calculate_stage_in_queue_s(
-                    stage_gen_time_ms=_m.stage_gen_time_ms,
-                    diffusion_exec_s=_diff_m.get("diffusion_engine_exec_time_s"),
-                    postprocess_s=_diff_m.get("postprocess_time_s"),
-                )
+                stage_in_queue_s = _diff_m.get("scheduler_queue_wait_s")
                 if stage_in_queue_s is not None:
-                    self.prom_metrics.observe_stage_in_queue(stage_id, stage_in_queue_s)
+                    self.prom_metrics.observe_stage_in_queue(stage_id, float(stage_in_queue_s))
                 if _m.output_unit_type == "image":
                     if result.replica_id is not None:
-                        self.mod_metrics.observe_denoise_step_latency(
-                            str(stage_id),
-                            str(result.replica_id),
-                            _m.denoise_step_latency_ms / 1000.0,
-                        )
                         self.mod_metrics.observe_image_ttfp(
                             str(stage_id),
                             str(result.replica_id),

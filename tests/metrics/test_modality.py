@@ -334,11 +334,13 @@ class TestObserveModalityAtFinalize:
     def test_diffusion_path_full(self):
         stub = _StubModMetrics()
         stage_metrics = _Bag(
+            output_unit_type="image",
             stage_gen_time_ms=1000.0,
             diffusion_metrics={
                 "preprocess_time_s": 0.05,
                 "diffusion_engine_exec_time_s": 1.2,
                 "postprocess_time_s": 0.3,
+                "forward_time_s": 1.0,
                 "image_num": 1,
                 "resolution": 1024,
                 "num_inference_steps": 50,
@@ -356,6 +358,24 @@ class TestObserveModalityAtFinalize:
         assert ("observe_diffusion_exec", "2", "0", 1.2) in stub.calls
         assert ("observe_diffusion_postprocess", "2", "0", 0.3) in stub.calls
         assert ("observe_diffusion_exec_per_step", "2", "0", pytest.approx(0.024)) in stub.calls
+        assert ("observe_denoise_step_latency", "2", "0", pytest.approx(0.02)) in stub.calls
+
+    def test_denoise_step_latency_requires_forward_time(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(
+            output_unit_type="image",
+            num_inference_steps=20,
+            diffusion_metrics={"diffusion_engine_exec_time_s": 1.2},
+        )
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=_Bag(),
+        )
+        assert not any(c[0] == "observe_denoise_step_latency" for c in stub.calls)
 
     def test_diffusion_per_step_skipped_without_num_inference_steps(self):
         stub = _StubModMetrics()
@@ -465,6 +485,7 @@ class TestDiffusionUnitConversion:
                 "postprocess_time_ms": 20.0,
                 "vae_decode_time_ms": 300.0,
                 "forward_time_ms": 800.0,
+                "scheduler_queue_wait_ms": 125.0,
                 "kv_recv_time_ms": 40.0,
             }
         )
@@ -477,6 +498,7 @@ class TestDiffusionUnitConversion:
             "postprocess_time_s": pytest.approx(0.02),
             "vae_decode_time_s": pytest.approx(0.3),
             "forward_time_s": pytest.approx(0.8),
+            "scheduler_queue_wait_s": pytest.approx(0.125),
             "kv_recv_time_s": pytest.approx(0.04),
         }
 

@@ -403,6 +403,8 @@ class DiffusionEngine:
                     "postprocess_time_ms": postprocess_time * 1000,
                     metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: self._scheduler_num_waiting_reqs,
                 }
+                if request.scheduler_queue_wait_ms is not None:
+                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
                 vae_decode_ms = _extract_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms

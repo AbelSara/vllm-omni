@@ -642,11 +642,6 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
@@ -697,7 +692,6 @@ class StagePool:
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
             num_inference_steps=num_inference_steps,
-            denoise_step_latency_ms=denoise_step_latency_ms,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,

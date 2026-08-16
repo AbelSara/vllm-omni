@@ -187,7 +187,7 @@ second.
 | `vllm:omni_stage_gen_time_s` | Histogram | `model_name`, `stage`, `stage_type` | Stage submit to finished output; includes in-stage queueing |
 | `vllm:omni_request_queue_wait_s` | Histogram | `model_name` | Orchestration-layer queue wait; a present zero is recorded |
 | `vllm:omni_stage_waiting_requests` | Gauge | `model_name`, `stage` | Sum of the latest waiting snapshots across live replicas in the stage |
-| `vllm:omni_stage_in_queue_s` | Histogram | `model_name`, `stage` | Diffusion-stage wait estimated as stage time minus diffusion execution and postprocess time |
+| `vllm:omni_stage_in_queue_s` | Histogram | `model_name`, `stage` | Diffusion scheduler wait from enqueue to initial execution admission |
 | `vllm:omni_num_inference_steps` | Histogram | `model_name` | Denoising-step distribution for diffusion stages |
 | `vllm:omni_image_count_total` | Counter | `model_name` | Cumulative number of generated image outputs |
 | `vllm:omni_image_pixels` | Histogram | `model_name` | Pixel-count distribution for image outputs |
@@ -209,7 +209,7 @@ Labels: `{model_name, stage, replica}`.
 | `vllm:omni_diffusion_forward_s` | Histogram | Forward-only denoise-loop time when pipeline profiling is enabled |
 | `vllm:omni_diffusion_kv_load_s` | Histogram | Diffusion-side KV receive/load time when upstream KV is used |
 | `vllm:omni_image_ttfp_s` | Histogram | Image-stage submit to first materialized image output |
-| `vllm:omni_denoise_step_latency_s` | Histogram | Mean denoise-step latency for image output stages |
+| `vllm:omni_denoise_step_latency_s` | Histogram | Mean diffusion forward time per denoise step for image output stages |
 
 The optional breakdown and memory families are sparse by design: when an engine does not produce the source measurement, no sample is emitted. This differs from queue timings, where an explicitly measured zero is meaningful and is retained.
 
@@ -241,36 +241,6 @@ Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 ### LLM stage-level (wrapped `vllm:*`)
 
 After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency, KV cache usage, scheduler running/waiting, request success counts, etc. — carries `{model_name, stage, replica}` labels. For the full upstream catalog see [the vLLM docs](https://github.com/vllm-project/vllm/blob/main/docs/usage/metrics.md); note that metrics depending on features unsupported in vLLM-Omni (e.g. speculative decoding, LoRA) will not be available.
-
-## Image Metrics Smoke Check
-
-Metrics collection is disabled unless the server is started with `--log-stats`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen-Image \
-  --omni --port 8000 --log-stats
-```
-
-After the server is ready, submit a small image request and scrape the endpoint:
-
-```bash
-curl -fsS -o /tmp/t2i.png \
-  -X POST http://localhost:8000/v1/images/generations \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "a small red robot reading a book",
-    "size": "512x512",
-    "num_inference_steps": 4,
-    "seed": 42,
-    "response_format": "file"
-  }'
-
-curl -fsS http://localhost:8000/metrics > /tmp/t2i_metrics.txt
-grep -E '^vllm:omni_(stage_gen_time_s|request_queue_wait_s|stage_waiting_requests|num_inference_steps|image_count_total|image_pixels|diffusion_)' \
-  /tmp/t2i_metrics.txt
-```
-
-At minimum, a successful request should increment the image Counter and the relevant Histogram `_count` series. The step and pixel Histogram sums should reflect the request (`4` and `512 * 512` in this example), and `stage_gen_time_s` should carry `stage_type="diffusion"`. The same output-side metrics apply to image-edit requests. Optional profiler, memory, and KV families may be absent when their data source is inactive.
 
 ## Naming Convention
 
