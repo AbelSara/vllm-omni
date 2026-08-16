@@ -52,7 +52,8 @@ _request_queue_wait_family = Histogram(
 )
 _stage_waiting_requests_family = Gauge(
     defs.STAGE_WAITING_REQUESTS,
-    "Per-stage in-flight waiting request count.",
+    "Sum of the latest scheduler waiting snapshots across a stage's replicas; "
+    "diffusion snapshots update when outputs arrive.",
     labelnames=list(defs.DIFFUSION_LABELS),
 )
 _num_inference_steps_family = Histogram(
@@ -77,18 +78,19 @@ _peak_memory_family = Gauge(
 )
 _stage_in_queue_family = Histogram(
     defs.STAGE_IN_QUEUE_S,
-    "In-stage pool queue wait in seconds (stage_gen_time minus diffusion "
-    "engine exec). Approximates the time a request waited in the stage pool "
-    "before execution began.",
-    labelnames=list(defs.STAGE_GEN_TIME_LABELS),
+    "In-stage pool queue wait in seconds. stage_gen_time minus diffusion exec "
+    "and postprocess — both run after the pool dequeues, so subtracting them "
+    "isolates the wait before execution began. Zero is the healthy low-load "
+    "baseline and is counted.",
+    labelnames=list(defs.DIFFUSION_LABELS),
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
 
 _requests_failed_family = Counter(
     defs.REQUESTS_FAILED,
     "Total requests by failure reason. Pairs with requests_success_total "
-    "(abort bucket) to give the full failure surface; this family breaks "
-    "out the taxonomy once the finalize-failure collection point lands.",
+    "(abort bucket) to give the full failure surface. Reasons are bounded to "
+    "client_abort, client_disconnect, stage_error, and unknown.",
     labelnames=list(defs.FAILED_LABELS),
 )
 _kv_wait_s_family = Histogram(
@@ -160,21 +162,22 @@ class OmniPrometheusMetrics:
             finished_reason="abort",
         ).inc()
 
-    def observe_stage_gen_time(self, stage: int, gen_time_s: float) -> None:
+    def observe_stage_gen_time(self, stage: int, stage_type: str, gen_time_s: float) -> None:
         if not self._log_stats:
             return
         _stage_gen_time_family.labels(
             model_name=self._model_name,
             stage=str(stage),
+            stage_type=stage_type,
         ).observe(max(gen_time_s, 0.0))
 
     def observe_stage_in_queue(self, stage: int, in_queue_s: float) -> None:
-        if not self._log_stats or in_queue_s <= 0:
+        if not self._log_stats:
             return
         _stage_in_queue_family.labels(
             model_name=self._model_name,
             stage=str(stage),
-        ).observe(in_queue_s)
+        ).observe(max(in_queue_s, 0.0))
 
     def observe_queue_wait(self, queue_wait_s: float) -> None:
         if not self._log_stats:

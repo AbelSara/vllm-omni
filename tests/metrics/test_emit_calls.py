@@ -1,15 +1,7 @@
 """Verify emit-call wiring in production code paths.
 
 `test_definitions.py` pins the family constants and label shapes; this file
-pins that the production side actually calls the observe / inc / set helpers
-declared on `OmniPrometheusMetrics`. Two layers:
-
-- ``TestEmitCallSiteStatic`` — source-code inspection via ``inspect.getsource``
-  so the test fails fast if a future refactor removes an emit call without
-  updating the metrics surface.
-- ``TestFailureCounterWiring`` / ``TestPromMetricsPlumbing`` — behavioral
-  checks with mock ``OmniPrometheusMetrics`` to verify the call semantics
-  (reason taxonomy propagation, kwarg threading).
+uses behavior and Prometheus exposition to verify production call semantics.
 """
 
 from __future__ import annotations
@@ -17,11 +9,11 @@ from __future__ import annotations
 import inspect
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from vllm_omni.metrics import OmniPrometheusMetrics
+from vllm_omni.metrics import definitions as defs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,105 +21,11 @@ _MODEL = "emit-calls-test"
 
 
 # ---------------------------------------------------------------------------
-# Static source-level pins — fail fast if emit calls disappear from prod code.
-# ---------------------------------------------------------------------------
-
-
-class TestEmitCallSiteStatic:
-    """Source-code inspection of production emit call sites.
-
-    Each test reads the function source via ``inspect.getsource`` so the test
-    fails fast if a refactor drops the emit call without updating the metrics
-    surface. The string-match is intentionally literal — the call must appear
-    in the function body, not just somewhere in the module.
-    """
-
-    def test_omni_base_process_single_result_emits_per_stage_metrics(self) -> None:
-        from vllm_omni.entrypoints.omni_base import OmniBase
-
-        src = inspect.getsource(OmniBase._process_single_result)
-        # Per-stage finish block.
-        assert "observe_stage_gen_time(" in src, "missing observe_stage_gen_time emit"
-        assert "observe_image_pixels(" in src, "missing observe_image_pixels emit"
-        assert "observe_num_inference_steps(" in src, "missing observe_num_inference_steps emit"
-        assert "inc_image_count(" in src, "missing inc_image_count emit"
-        # Per-step denoise latency emit, scoped to image output_unit_type.
-        assert "observe_denoise_step_latency(" in src, "missing observe_denoise_step_latency emit"
-        # Finalize-time block.
-        assert "set_peak_memory(" in src, "missing set_peak_memory emit"
-        assert "observe_queue_wait(" in src, "missing observe_queue_wait emit"
-
-    def test_omni_base_failure_paths_emit_requests_failed(self) -> None:
-        from vllm_omni.entrypoints.omni_base import OmniBase
-
-        fire_src = inspect.getsource(OmniBase._fire_failure_counter_if_alive)
-        assert "inc_requests_failed(" in fire_src, "_fire_failure_counter_if_alive missing inc_requests_failed emit"
-        assert "reason" in fire_src, "_fire_failure_counter_if_alive missing reason parameter"
-
-        log_src = inspect.getsource(OmniBase._log_summary_and_cleanup)
-        assert "inc_requests_failed(" in log_src, "_log_summary_and_cleanup missing inc_requests_failed emit"
-        assert "reason" in log_src, "_log_summary_and_cleanup missing reason parameter"
-
-    def test_orchestrator_loop_emits_stage_waiting_requests(self) -> None:
-        from vllm_omni.engine.orchestrator import Orchestrator
-
-        src = inspect.getsource(Orchestrator._orchestration_loop)
-        assert "set_stage_waiting_requests(" in src, "_orchestration_loop missing set_stage_waiting_requests emit"
-        assert "num_waiting_reqs" in src, "_orchestration_loop not reading scheduler_stats.num_waiting_reqs"
-
-    def test_omni_base_emits_image_ttfp_and_stage_in_queue(self) -> None:
-        from vllm_omni.entrypoints.omni_base import OmniBase
-
-        src = inspect.getsource(OmniBase._process_single_result)
-        assert "observe_image_ttfp(" in src, "missing observe_image_ttfp emit in image path"
-        assert "serving_time_to_first_output_ms" in src, "image_ttfp must source serving_time_to_first_output_ms"
-        assert "observe_stage_in_queue(" in src, "missing observe_stage_in_queue emit"
-        assert "diffusion_engine_exec_time_s" in src, "stage_in_queue must subtract diffusion_engine_exec_time_s"
-
-    def test_stage_pool_build_stage_metrics_plumbs_num_inference_steps(self) -> None:
-        from vllm_omni.engine.stage_pool import StagePool
-
-        src = inspect.getsource(StagePool.build_stage_metrics)
-        assert "num_inference_steps=num_inference_steps" in src, (
-            "build_stage_metrics missing num_inference_steps= kwarg in return"
-        )
-
-    def test_scheduler_records_kv_wait_enter_timestamps(self) -> None:
-        # _free_request must stamp time.monotonic() at both ENTER paths into
-        # waiting_for_transfer_free (active-transfer wait + not-yet-triggered).
-        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
-        src = inspect.getsource(OmniARScheduler._free_request)
-        assert src.count("_kv_wait_start_ts[request_id] = time.monotonic()") == 2, (
-            "_free_request must record kv_wait start ts at both ENTER paths"
-        )
-
-    def test_scheduler_emits_kv_wait_output_on_extraction_ack(self) -> None:
-        # The kv_extracted_ids pre-process loop must call _emit_kv_wait_output,
-        # which carries the wait duration across the process boundary.
-        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
-        src = inspect.getsource(OmniARScheduler.update_from_output)
-        assert "_emit_kv_wait_output(" in src, "update_from_output missing _emit_kv_wait_output call on extraction ack"
-        emit_src = inspect.getsource(OmniARScheduler._emit_kv_wait_output)
-        assert "_kv_wait_start_ts.pop" in emit_src, "_emit_kv_wait_output must pop the start ts"
-        assert '"kv_wait_s"' in emit_src, "_emit_kv_wait_output must carry kv_wait_s"
-        assert '"connector_type"' in emit_src, "_emit_kv_wait_output must carry connector_type"
-
-    def test_orchestrator_loop_emits_kv_wait(self) -> None:
-        from vllm_omni.engine.orchestrator import Orchestrator
-
-        src = inspect.getsource(Orchestrator._orchestration_loop)
-        assert "observe_kv_wait(" in src, "_orchestration_loop missing observe_kv_wait emit"
-        assert "kv_wait_s" in src, "_orchestration_loop not reading kv_wait_s from kv_transfer_params"
-
-
-# ---------------------------------------------------------------------------
 # Behavioral pins — verify call semantics with mock OmniPrometheusMetrics.
 # ---------------------------------------------------------------------------
 
 
-def _make_omni_base_with_mock_prom() -> tuple[object, MagicMock]:
+def _make_omni_base_with_mock_prom(mocker):
     """Build a minimal OmniBase shell wired with a mock prom_metrics.
 
     Mirrors the pattern in ``test_prometheus.py::TestRequestLifecycleGauges``
@@ -136,7 +34,7 @@ def _make_omni_base_with_mock_prom() -> tuple[object, MagicMock]:
     from vllm_omni.entrypoints.omni_base import OmniBase
 
     obj = object.__new__(OmniBase)
-    obj.prom_metrics = MagicMock(spec=OmniPrometheusMetrics)
+    obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
     obj.request_states = {}
     obj._consumed_metric_messages = {}
     obj.log_stats = True
@@ -144,16 +42,24 @@ def _make_omni_base_with_mock_prom() -> tuple[object, MagicMock]:
 
 
 class TestFailureCounterWiring:
-    """`_fire_failure_counter_if_alive` and `_log_summary_and_cleanup` must
-    call BOTH the legacy `request_failed()` (which writes the abort bucket of
-    `requests_success_total`) and the new `inc_requests_failed(reason)` (which
-    writes `requests_failed_total` with the reason taxonomy).
-    """
+    """All failure paths share one request-idempotent counter helper."""
 
-    def test_fire_failure_counter_passes_reason_through(self) -> None:
-        obj, prom = _make_omni_base_with_mock_prom()
+    def test_failure_reason_taxonomy_is_bounded(self) -> None:
+        from vllm_omni.entrypoints.omni_base import _normalize_failure_reason
+
+        assert _normalize_failure_reason("client_abort") == "client_abort"
+        assert _normalize_failure_reason("client_disconnect") == "client_disconnect"
+        assert _normalize_failure_reason("stage_error") == "stage_error"
+        assert _normalize_failure_reason("unknown") == "unknown"
+        assert _normalize_failure_reason("timeout for request req-1") == "unknown"
+        assert _normalize_failure_reason("") == "unknown"
+        assert _normalize_failure_reason(None) == "unknown"
+
+    def test_fire_failure_counter_passes_reason_through(self, mocker) -> None:
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(e2e_done=set()),
+            failure_recorded=False,
         )
 
         obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
@@ -161,22 +67,35 @@ class TestFailureCounterWiring:
         prom.request_failed.assert_called_once()
         prom.inc_requests_failed.assert_called_once_with("client_disconnect")
 
-    def test_fire_failure_counter_default_reason_is_stage_error(self) -> None:
-        obj, prom = _make_omni_base_with_mock_prom()
+    def test_fire_failure_counter_default_reason_is_stage_error(self, mocker) -> None:
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(e2e_done=set()),
+            failure_recorded=False,
         )
 
         obj._fire_failure_counter_if_alive("req-1")
 
         prom.inc_requests_failed.assert_called_once_with("stage_error")
 
-    def test_fire_failure_counter_skips_when_request_already_succeeded(self) -> None:
+    def test_fire_failure_counter_normalizes_unrecognized_reason(self, mocker) -> None:
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
+        obj.request_states["req-1"] = SimpleNamespace(
+            metrics=SimpleNamespace(e2e_done=set()),
+            failure_recorded=False,
+        )
+
+        obj._fire_failure_counter_if_alive("req-1", reason="CUDA error for req-1")
+
+        prom.inc_requests_failed.assert_called_once_with("unknown")
+
+    def test_fire_failure_counter_skips_when_request_already_succeeded(self, mocker) -> None:
         # When the request is in e2e_done (i.e. finalize already fired
         # request_succeeded), the failure path must NOT double-count.
-        obj, prom = _make_omni_base_with_mock_prom()
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(e2e_done={"req-1"}),
+            failure_recorded=False,
         )
 
         obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
@@ -184,37 +103,40 @@ class TestFailureCounterWiring:
         prom.request_failed.assert_not_called()
         prom.inc_requests_failed.assert_not_called()
 
-    def test_fire_failure_counter_skips_when_request_state_missing(self) -> None:
+    def test_fire_failure_counter_skips_when_request_state_missing(self, mocker) -> None:
         # No request_states entry — already popped by abort path. Fail-safe
         # must NOT raise.
-        obj, prom = _make_omni_base_with_mock_prom()
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
 
         obj._fire_failure_counter_if_alive("missing-req", reason="oom")
 
         prom.request_failed.assert_not_called()
         prom.inc_requests_failed.assert_not_called()
 
-    def test_log_summary_and_cleanup_passes_reason_through(self) -> None:
-        obj, prom = _make_omni_base_with_mock_prom()
+    def test_failure_counter_is_idempotent_across_abort_and_cleanup(self, mocker) -> None:
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
                 build_and_log_summary=lambda: None,
             ),
+            failure_recorded=False,
         )
 
-        obj._log_summary_and_cleanup("req-1", reason="timeout")
+        obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
+        obj._log_summary_and_cleanup("req-1", reason="stage_error")
 
         prom.request_failed.assert_called_once()
-        prom.inc_requests_failed.assert_called_once_with("timeout")
+        prom.inc_requests_failed.assert_called_once_with("client_disconnect")
 
-    def test_log_summary_and_cleanup_default_reason(self) -> None:
-        obj, prom = _make_omni_base_with_mock_prom()
+    def test_log_summary_and_cleanup_default_reason(self, mocker) -> None:
+        obj, prom = _make_omni_base_with_mock_prom(mocker)
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
                 build_and_log_summary=lambda: None,
             ),
+            failure_recorded=False,
         )
 
         obj._log_summary_and_cleanup("req-1")
@@ -230,7 +152,7 @@ class TestFailureCounterWiring:
 
 class TestPromMetricsPlumbing:
     def test_async_omni_engine_init_accepts_prom_metrics_kwarg(self) -> None:
-        from vllm_omni.entrypoints.async_omni import AsyncOmniEngine
+        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
         sig = inspect.signature(AsyncOmniEngine.__init__)
         assert "prom_metrics" in sig.parameters, (
@@ -257,16 +179,6 @@ class TestPromMetricsPlumbing:
             "prom_metrics should default to None so unit-test engines without prom_metrics still construct cleanly"
         )
 
-    def test_omni_base_runs_orchestrator_forwards_prom_metrics(self) -> None:
-        # Static check that AsyncOmniEngine._run_orchestrator forwards
-        # self._prom_metrics into the Orchestrator construction.
-        from vllm_omni.entrypoints.async_omni import AsyncOmniEngine
-
-        src = inspect.getsource(AsyncOmniEngine._run_orchestrator)
-        assert "prom_metrics=self._prom_metrics" in src, (
-            "AsyncOmniEngine._run_orchestrator not forwarding self._prom_metrics to Orchestrator construction"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Observe-method surface pins — verify the OmniPrometheusMetrics API surface
@@ -274,7 +186,7 @@ class TestPromMetricsPlumbing:
 # ---------------------------------------------------------------------------
 
 _EXPECTED_OBSERVE_METHODS: dict[str, tuple[str, ...]] = {
-    "observe_stage_gen_time": ("stage", "gen_time_s"),
+    "observe_stage_gen_time": ("stage", "stage_type", "gen_time_s"),
     "observe_stage_in_queue": ("stage", "in_queue_s"),
     "observe_queue_wait": ("queue_wait_s",),
     "set_stage_waiting_requests": ("stage", "n_waiting"),
@@ -322,7 +234,7 @@ class TestEarlyReturnOnLogStatsOff:
     def test_observe_methods_silent_when_log_stats_false(self) -> None:
         prom = OmniPrometheusMetrics(model_name=_MODEL, log_stats=False)
         # None of these should raise or write to the registry.
-        prom.observe_stage_gen_time(stage=0, gen_time_s=1.5)
+        prom.observe_stage_gen_time(stage=0, stage_type="llm", gen_time_s=1.5)
         prom.observe_stage_in_queue(stage=0, in_queue_s=0.2)
         prom.observe_queue_wait(queue_wait_s=0.5)
         prom.set_stage_waiting_requests(stage=0, n_waiting=3)
@@ -334,19 +246,255 @@ class TestEarlyReturnOnLogStatsOff:
         prom.observe_kv_wait(connector_type="shm", kv_wait_s=0.01)
 
 
+class TestStageGenerationLabels:
+    def test_stage_gen_time_exposes_bounded_stage_type(self) -> None:
+        from prometheus_client import REGISTRY, generate_latest
+
+        model = _MODEL + "-stage-type"
+        prom = OmniPrometheusMetrics(model_name=model, log_stats=True)
+        prom.observe_stage_gen_time(stage=0, stage_type="llm", gen_time_s=0.25)
+        prom.observe_stage_gen_time(stage=1, stage_type="diffusion", gen_time_s=1.5)
+
+        out = generate_latest(REGISTRY).decode()
+        assert f'{defs.STAGE_GEN_TIME_S}_count{{model_name="{model}",stage="0",stage_type="llm"}} 1.0' in out
+        assert f'{defs.STAGE_GEN_TIME_S}_count{{model_name="{model}",stage="1",stage_type="diffusion"}} 1.0' in out
+
+
+class TestCounterExpositionNames:
+    def test_counter_families_have_exactly_one_total_suffix(self) -> None:
+        from prometheus_client import REGISTRY, generate_latest
+
+        model = _MODEL + "-counter-suffix"
+        prom = OmniPrometheusMetrics(model_name=model, log_stats=True)
+        prom.inc_image_count(2)
+        prom.inc_requests_failed("stage_error")
+
+        out = generate_latest(REGISTRY).decode()
+        assert f'{defs.IMAGE_COUNT_METRIC}_total{{model_name="{model}"}} 2.0' in out
+        assert f'{defs.REQUESTS_FAILED}_total{{model_name="{model}",reason="stage_error"}} 1.0' in out
+        assert f"{defs.IMAGE_COUNT_METRIC}_total_total" not in out
+        assert f"{defs.REQUESTS_FAILED}_total_total" not in out
+
+
+class TestQueueWaitExtraction:
+    def test_present_zero_is_a_valid_observation(self) -> None:
+        from vllm_omni.entrypoints.omni_base import _extract_queue_wait_s
+
+        assert _extract_queue_wait_s({"queue_wait_ms": 0.0}) == 0.0
+
+    def test_missing_queue_wait_is_not_synthetic_zero(self) -> None:
+        from vllm_omni.entrypoints.omni_base import _extract_queue_wait_s
+
+        assert _extract_queue_wait_s({"preprocess_ms": 2.0}) is None
+        assert _extract_queue_wait_s(None) is None
+
+
+class TestStageInQueueCalculation:
+    @staticmethod
+    def _calculate(
+        *,
+        stage_gen_time_ms: float,
+        diffusion_exec_s: float | None,
+        postprocess_s: float | None,
+    ):
+        from vllm_omni.entrypoints.omni_base import _calculate_stage_in_queue_s
+
+        return _calculate_stage_in_queue_s(
+            stage_gen_time_ms=stage_gen_time_ms,
+            diffusion_exec_s=diffusion_exec_s,
+            postprocess_s=postprocess_s,
+        )
+
+    def test_positive_wait_is_preserved(self) -> None:
+        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.8, postprocess_s=0.1)
+
+        assert result == pytest.approx(0.1)
+
+    def test_valid_zero_wait_is_preserved(self) -> None:
+        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.9, postprocess_s=0.1)
+
+        assert result == 0.0
+
+    def test_prometheus_records_valid_zero_wait(self) -> None:
+        from prometheus_client import REGISTRY, generate_latest
+
+        model = _MODEL + "-zero-stage-wait"
+        prom = OmniPrometheusMetrics(model_name=model, log_stats=True)
+
+        prom.observe_stage_in_queue(stage=1, in_queue_s=0.0)
+
+        out = generate_latest(REGISTRY).decode()
+        sample = f'{defs.STAGE_IN_QUEUE_S}_count{{model_name="{model}",stage="1"}} 1.0'
+        assert sample in out
+
+    def test_negative_rounding_artifact_is_clamped(self) -> None:
+        result = self._calculate(stage_gen_time_ms=999.0, diffusion_exec_s=0.9, postprocess_s=0.1)
+
+        assert result == 0.0
+
+    def test_missing_exec_time_skips_observation(self) -> None:
+        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=None, postprocess_s=0.1)
+
+        assert result is None
+
+    def test_missing_postprocess_time_is_zero(self) -> None:
+        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.8, postprocess_s=None)
+
+        assert result == pytest.approx(0.2)
+
+
+class TestStageWorkloadMetricScope:
+    @staticmethod
+    def _observe(mocker, *, stage_type: str, output_unit_type: str):
+        from vllm_omni.entrypoints.omni_base import _observe_stage_workload_metrics
+
+        prom = mocker.Mock(spec=OmniPrometheusMetrics)
+        stage_metrics = SimpleNamespace(
+            num_inference_steps=50,
+            output_unit_type=output_unit_type,
+            image_pixels=1024 * 1024,
+            output_unit_count=2,
+        )
+        _observe_stage_workload_metrics(
+            prom,
+            stage_type=stage_type,
+            stage_metrics=stage_metrics,
+        )
+        return prom
+
+    def test_diffusion_image_observes_steps_and_image_workload(self, mocker) -> None:
+        prom = self._observe(mocker, stage_type="diffusion", output_unit_type="image")
+
+        prom.observe_num_inference_steps.assert_called_once_with(50)
+        prom.observe_image_pixels.assert_called_once_with(1024 * 1024)
+        prom.inc_image_count.assert_called_once_with(2)
+
+    def test_diffusion_video_observes_steps_only(self, mocker) -> None:
+        prom = self._observe(mocker, stage_type="diffusion", output_unit_type="video")
+
+        prom.observe_num_inference_steps.assert_called_once_with(50)
+        prom.observe_image_pixels.assert_not_called()
+        prom.inc_image_count.assert_not_called()
+
+    def test_llm_text_observes_no_workload_metrics(self, mocker) -> None:
+        prom = self._observe(mocker, stage_type="llm", output_unit_type="text")
+
+        prom.observe_num_inference_steps.assert_not_called()
+        prom.observe_image_pixels.assert_not_called()
+        prom.inc_image_count.assert_not_called()
+
+    def test_non_diffusion_image_observes_image_workload_only(self, mocker) -> None:
+        prom = self._observe(mocker, stage_type="llm", output_unit_type="image")
+
+        prom.observe_num_inference_steps.assert_not_called()
+        prom.observe_image_pixels.assert_called_once_with(1024 * 1024)
+        prom.inc_image_count.assert_called_once_with(2)
+
+    @pytest.mark.parametrize("peak_memory_mb", [2048.0, 0.0])
+    def test_same_finished_image_message_is_observed_exactly_once(self, mocker, peak_memory_mb: float) -> None:
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        obj = object.__new__(OmniBase)
+        obj._enable_ar_profiler = False
+        obj._consumed_metric_messages = {}
+        obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
+        obj.mod_metrics = mocker.Mock()
+        obj.engine = SimpleNamespace(
+            get_stage_metadata=lambda _stage_id: SimpleNamespace(
+                stage_type="diffusion",
+                final_output=False,
+                final_output_type="image",
+            )
+        )
+        stage_metrics = SimpleNamespace(
+            stage_gen_time_ms=1000.0,
+            diffusion_metrics={"diffusion_engine_exec_time_s": 0.8, "postprocess_time_s": 0.1},
+            num_inference_steps=20,
+            output_unit_type="image",
+            image_pixels=1024 * 1024,
+            output_unit_count=1,
+            denoise_step_latency_ms=40.0,
+            serving_time_to_first_output_ms=250.0,
+            pipeline_timings={},
+        )
+        result = SimpleNamespace(
+            request_id="req-replay",
+            stage_id=1,
+            replica_id=0,
+            stage_submit_ts=10.0,
+            metrics=stage_metrics,
+            engine_outputs=SimpleNamespace(
+                stage_durations={},
+                peak_memory_mb=peak_memory_mb,
+                finished=True,
+                final_output_type="image",
+            ),
+        )
+        aggregator = mocker.Mock()
+        aggregator.stage_events = {}
+        aggregator.stage_first_ts = [None, None]
+        aggregator.stage_last_ts = [None, None]
+
+        for _ in range(2):
+            assert obj._process_single_result(result, 1, aggregator, {}, 0.0, 1) is None
+
+        aggregator.on_stage_metrics.assert_called_once_with(1, "req-replay", stage_metrics, "image")
+        obj.prom_metrics.inc_image_count.assert_called_once_with(1)
+        obj.prom_metrics.observe_image_pixels.assert_called_once_with(1024 * 1024)
+        obj.prom_metrics.observe_num_inference_steps.assert_called_once_with(20)
+        if peak_memory_mb > 0:
+            obj.prom_metrics.set_peak_memory.assert_called_once_with(1, peak_memory_mb)
+        else:
+            obj.prom_metrics.set_peak_memory.assert_not_called()
+        obj.mod_metrics.observe_image_ttfp.assert_called_once_with("1", "0", 0.25)
+
+
+class TestStageWaitingAggregation:
+    @staticmethod
+    def _make_orchestrator(mocker):
+        from vllm_omni.engine.orchestrator import Orchestrator
+
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator._prom_metrics = mocker.Mock()
+        orchestrator._stage_replica_waiting = {}
+        return orchestrator
+
+    def test_multiple_replicas_are_summed(self, mocker) -> None:
+        orchestrator = self._make_orchestrator(mocker)
+
+        orchestrator._update_stage_replica_waiting(1, 0, 3)
+        orchestrator._update_stage_replica_waiting(1, 1, 5)
+
+        orchestrator._prom_metrics.set_stage_waiting_requests.assert_called_with(1, 8)
+
+    def test_zero_update_and_stage_isolation(self, mocker) -> None:
+        orchestrator = self._make_orchestrator(mocker)
+
+        orchestrator._update_stage_replica_waiting(1, 0, 3)
+        orchestrator._update_stage_replica_waiting(2, 0, 7)
+        orchestrator._update_stage_replica_waiting(1, 0, 0)
+
+        orchestrator._prom_metrics.set_stage_waiting_requests.assert_called_with(1, 0)
+        assert orchestrator._stage_replica_waiting[(2, 0)] == 7
+
+    def test_dead_replica_snapshot_is_removed(self, mocker) -> None:
+        orchestrator = self._make_orchestrator(mocker)
+        orchestrator._update_stage_replica_waiting(1, 0, 3)
+        orchestrator._update_stage_replica_waiting(1, 1, 5)
+
+        orchestrator._remove_stage_replica_waiting(1, 1)
+
+        orchestrator._prom_metrics.set_stage_waiting_requests.assert_called_with(1, 3)
+
+
 # ---------------------------------------------------------------------------
-# Behavioral pin: emit sites call unconditional observe_* even for text
-# stages where image_pixels / num_inference_steps are zero — the helper
-# early-returns on <=0. Verify the zero-guard contract.
+# Behavioral pin: call sites now scope workload observations by stage/output
+# type. Keep the Prometheus wrapper's <= 0 guard as a second line of defense.
 # ---------------------------------------------------------------------------
 
 
 class TestZeroGuardContract:
-    """Image / diffusion helpers must early-return on zero so the per-stage
-    finish block can call unconditionally — text stages contribute zeros
-    without polluting the histogram. The guard is ``<= 0`` (not ``< 0``) so
-    zero-valued observations don't bump ``_count`` to 1.
-    """
+    """Zero-valued observations must not bump histogram ``_count``."""
 
     def test_zero_image_pixels_not_observed(self) -> None:
         from prometheus_client import REGISTRY, generate_latest
@@ -447,14 +595,38 @@ class TestKvWaitSchedulerEmit:
         assert eco.kv_transfer_params["connector_type"] == "SharedMemoryConnector"
 
 
-class TestKvWaitOrchestratorDispatch:
-    """Orchestrator reads kv_wait_s from kv_transfer_params and calls observe_kv_wait."""
+class TestKvWaitTerminalCleanup:
+    def test_finish_requests_clears_requested_wait_only(self, mocker) -> None:
+        from vllm.v1.request import RequestStatus
 
-    def test_orchestrator_static_dispatch_reads_kv_wait_s(self) -> None:
-        from vllm_omni.engine.orchestrator import Orchestrator
+        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+        from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
-        src = inspect.getsource(Orchestrator._orchestration_loop)
-        assert "self._prom_metrics is not None" in src
-        assert 'kv_params.get("kv_wait_s")' in src
-        assert 'kv_params.get("connector_type")' in src
-        assert "observe_kv_wait(" in src
+        scheduler = object.__new__(OmniARScheduler)
+        scheduler._kv_wait_start_ts = {"req-1": 10.0, "req-2": 20.0}
+        parent_finish = mocker.patch.object(OmniSchedulerMixin, "finish_requests", return_value=[])
+
+        finished = scheduler.finish_requests(
+            (request_id for request_id in ["req-1"]),
+            RequestStatus.FINISHED_ABORTED,
+        )
+
+        assert finished == []
+        assert "req-1" not in scheduler._kv_wait_start_ts
+        assert scheduler._kv_wait_start_ts["req-2"] == 20.0
+        parent_finish.assert_called_once()
+
+    def test_cleanup_is_idempotent_when_timestamp_is_already_gone(self, mocker) -> None:
+        from vllm.v1.request import RequestStatus
+
+        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+        from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+        scheduler = object.__new__(OmniARScheduler)
+        scheduler._kv_wait_start_ts = {}
+        parent_finish = mocker.patch.object(OmniSchedulerMixin, "finish_requests", return_value=[])
+
+        scheduler.finish_requests("req-already-emitted", RequestStatus.FINISHED_ABORTED)
+
+        assert scheduler._kv_wait_start_ts == {}
+        parent_finish.assert_called_once()

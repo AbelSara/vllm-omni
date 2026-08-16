@@ -1,7 +1,7 @@
 """Verify the image / diffusion metric family constants.
 
 Pins:
-- 16 family names share the ``vllm_omni:`` prefix
+- 19 family names share the ``vllm_omni:`` prefix
 - Counter-family constant values don't include ``_total`` (auto-suffixed by
   the prometheus_client at exposition)
 - All family names are unique within the new set and against the pre-existing
@@ -152,10 +152,10 @@ class TestLabelSets:
                 f"label set {labels!r} contains non-str or empty entries"
             )
 
-    def test_stage_gen_time_labels_are_model_and_stage(self) -> None:
-        # No final_output_type — per-modality slicing goes through
-        # e2e_request_latency_s.
-        assert defs.STAGE_GEN_TIME_LABELS == ("model_name", "stage")
+    def test_stage_gen_time_labels_include_stage_type(self) -> None:
+        # stage_gen_time_s is a generic pipeline-stage metric. The bounded
+        # stage_type label lets dashboards select LLM or diffusion stages.
+        assert defs.STAGE_GEN_TIME_LABELS == ("model_name", "stage", "stage_type")
 
     def test_diffusion_labels_are_model_and_stage(self) -> None:
         # Used by stage_waiting_requests + peak_memory_mb (per-stage gauges).

@@ -56,6 +56,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics import definitions as metric_defs
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
@@ -406,6 +407,9 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # Copied onto the existing output metrics payload so queue monitoring
+        # reuses the normal diffusion result path without additional IPC.
+        self._scheduler_num_waiting_reqs = 0
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -490,8 +494,8 @@ class DiffusionEngine:
                 metrics_update = {
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                    "diffusion_engine_total_time_ms": step_total_ms,
                     "postprocess_time_ms": postprocess_time * 1000,
+                    metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: self._scheduler_num_waiting_reqs,
                 }
                 vae_decode_ms = _extract_vae_decode_ms(output)
                 if vae_decode_ms is not None:
@@ -593,6 +597,7 @@ class DiffusionEngine:
                 self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
+                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
