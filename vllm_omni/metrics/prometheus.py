@@ -78,10 +78,8 @@ _peak_memory_family = Gauge(
 )
 _stage_in_queue_family = Histogram(
     defs.STAGE_IN_QUEUE_S,
-    "In-stage pool queue wait in seconds. stage_gen_time minus diffusion exec "
-    "and postprocess — both run after the pool dequeues, so subtracting them "
-    "isolates the wait before execution began. Zero is the healthy low-load "
-    "baseline and is counted.",
+    "Time in seconds from diffusion scheduler enqueue to initial execution admission. "
+    "Zero is the healthy low-load baseline and is counted.",
     labelnames=list(defs.DIFFUSION_LABELS),
     buckets=defs.SECONDS_FAST_BUCKETS,
 )

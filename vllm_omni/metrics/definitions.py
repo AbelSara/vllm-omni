@@ -341,16 +341,6 @@ def compute_audio_frames(
     return pcm_nbytes // frame_width
 
 
-def compute_denoise_step_latency(stage_gen_time: float, num_inference_steps: int) -> float:
-    """Mean denoise step latency = image stage generation time / step count.
-
-    The returned value uses the same time unit as ``stage_gen_time``.
-    """
-    if num_inference_steps <= 0:
-        return 0.0
-    return stage_gen_time / float(num_inference_steps)
-
-
 # ============================================================================
 # Audio sample-rate resolution
 # ============================================================================

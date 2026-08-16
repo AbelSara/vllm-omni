@@ -50,7 +50,6 @@ class StageRequestStats:
     audio_duration_s: float = 0.0
     image_pixels: int = 0
     num_inference_steps: int = 0
-    denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
     output_unit_type: str | None = None
     output_unit_count: int = 0
@@ -477,7 +476,6 @@ class OrchestratorAggregator:
                 defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
                 f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
                 defs.IMAGE_PIXELS: int(evt.image_pixels),
-                defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
                 "output_unit_type": evt.output_unit_type,
                 defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
                 defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
@@ -504,9 +502,6 @@ class OrchestratorAggregator:
             evt.audio_duration_s
         )
         current[defs.IMAGE_PIXELS] = int(current.get(defs.IMAGE_PIXELS, 0)) + int(evt.image_pixels)
-        denoise_step_latency_ms = float(evt.denoise_step_latency_ms)
-        if denoise_step_latency_ms > 0:
-            current[defs.DENOISE_STEP_LATENCY_MS] = denoise_step_latency_ms
         current[defs.OUTPUT_UNIT_COUNT] = int(current.get(defs.OUTPUT_UNIT_COUNT, 0)) + int(evt.output_unit_count)
 
         first_output_ms = float(evt.serving_time_to_first_output_ms)
@@ -639,6 +634,7 @@ class OrchestratorAggregator:
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",
+        "scheduler_queue_wait_ms": "scheduler_queue_wait_s",
         "kv_recv_time_ms": "kv_recv_time_s",
     }
 

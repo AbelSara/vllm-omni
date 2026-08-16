@@ -207,32 +207,7 @@ class TestQueueWaitExtraction:
         assert _extract_queue_wait_s(None) is None
 
 
-class TestStageInQueueCalculation:
-    @staticmethod
-    def _calculate(
-        *,
-        stage_gen_time_ms: float,
-        diffusion_exec_s: float | None,
-        postprocess_s: float | None,
-    ):
-        from vllm_omni.entrypoints.omni_base import _calculate_stage_in_queue_s
-
-        return _calculate_stage_in_queue_s(
-            stage_gen_time_ms=stage_gen_time_ms,
-            diffusion_exec_s=diffusion_exec_s,
-            postprocess_s=postprocess_s,
-        )
-
-    def test_positive_wait_is_preserved(self) -> None:
-        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.8, postprocess_s=0.1)
-
-        assert result == pytest.approx(0.1)
-
-    def test_valid_zero_wait_is_preserved(self) -> None:
-        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.9, postprocess_s=0.1)
-
-        assert result == 0.0
-
+class TestStageInQueueObservation:
     def test_prometheus_records_valid_zero_wait(self) -> None:
         from prometheus_client import REGISTRY, generate_latest
 
@@ -244,21 +219,6 @@ class TestStageInQueueCalculation:
         out = generate_latest(REGISTRY).decode()
         sample = f'{defs.STAGE_IN_QUEUE_S}_count{{model_name="{model}",stage="1"}} 1.0'
         assert sample in out
-
-    def test_negative_rounding_artifact_is_clamped(self) -> None:
-        result = self._calculate(stage_gen_time_ms=999.0, diffusion_exec_s=0.9, postprocess_s=0.1)
-
-        assert result == 0.0
-
-    def test_missing_exec_time_skips_observation(self) -> None:
-        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=None, postprocess_s=0.1)
-
-        assert result is None
-
-    def test_missing_postprocess_time_is_zero(self) -> None:
-        result = self._calculate(stage_gen_time_ms=1000.0, diffusion_exec_s=0.8, postprocess_s=None)
-
-        assert result == pytest.approx(0.2)
 
 
 class TestStageWorkloadMetricScope:
@@ -326,12 +286,11 @@ class TestStageWorkloadMetricScope:
         )
         stage_metrics = SimpleNamespace(
             stage_gen_time_ms=1000.0,
-            diffusion_metrics={"diffusion_engine_exec_time_s": 0.8, "postprocess_time_s": 0.1},
+            diffusion_metrics={"diffusion_engine_exec_time_s": 0.8, "scheduler_queue_wait_s": 0.1},
             num_inference_steps=20,
             output_unit_type="image",
             image_pixels=1024 * 1024,
             output_unit_count=1,
-            denoise_step_latency_ms=40.0,
             serving_time_to_first_output_ms=250.0,
             pipeline_timings={},
         )
@@ -360,6 +319,7 @@ class TestStageWorkloadMetricScope:
         obj.prom_metrics.inc_image_count.assert_called_once_with(1)
         obj.prom_metrics.observe_image_pixels.assert_called_once_with(1024 * 1024)
         obj.prom_metrics.observe_num_inference_steps.assert_called_once_with(20)
+        obj.prom_metrics.observe_stage_in_queue.assert_called_once_with(1, 0.1)
         if peak_memory_mb > 0:
             obj.prom_metrics.set_peak_memory.assert_called_once_with(1, peak_memory_mb)
         else:
