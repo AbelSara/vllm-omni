@@ -318,43 +318,21 @@ def _observe_audio_finalize(
     gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
     mm_out = extract_mm_output(engine_outputs)
 
-    if output_type == "audio":
-        sample_rate = defs.resolve_audio_sample_rate(mm_out)
-        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-        if n_frames == 0:
-            n_frames = count_audio_frames(mm_out)
-        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-        if duration_s > 0:
-            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-            mod_metrics.observe_audio_rtf(
-                stage_label,
-                replica_label,
-                defs.compute_audio_rtf(gen_time_s, duration_s),
-            )
-        else:
-            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-
-    dm = getattr(stage_metrics, "diffusion_metrics", None)
-    if dm:
-        _key_map = {
-            "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
-            "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
-            "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
-        }
-        for key, observe_fn in _key_map.items():
-            val = dm.get(key)
-            if val is not None:
-                observe_fn(stage_label, replica_label, float(val))
-
-        exec_time = dm.get("diffusion_engine_exec_time_s")
-        num_steps = dm.get("num_inference_steps")
-        if exec_time is not None and num_steps and num_steps > 0:
-            mod_metrics.observe_diffusion_exec_per_step(
-                stage_label,
-                replica_label,
-                float(exec_time) / int(num_steps),
-            )
+    sample_rate = defs.resolve_audio_sample_rate(mm_out)
+    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+    if n_frames == 0:
+        n_frames = count_audio_frames(mm_out)
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+    if duration_s > 0:
+        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+        mod_metrics.observe_audio_rtf(
+            stage_label,
+            replica_label,
+            defs.compute_audio_rtf(gen_time_s, duration_s),
+        )
+    else:
+        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
 
 
 _DIFFUSION_EXEC_KEY = "diffusion_engine_exec_time_s"
@@ -382,7 +360,9 @@ def _observe_diffusion_finalize(
     exec_s = diff_metrics.get(_DIFFUSION_EXEC_KEY)
     if exec_s is not None:
         mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
-        num_steps = int(getattr(stage_metrics, "num_inference_steps", 0) or 0)
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
         if num_steps > 0:
             mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
 
