@@ -60,21 +60,10 @@ class TestFailureCounterWiring:
             failure_recorded=False,
         )
 
-        obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
+        obj._record_request_failure_once("req-1", reason="client_disconnect")
 
         prom.request_failed.assert_called_once()
         prom.inc_requests_failed.assert_called_once_with("client_disconnect")
-
-    def test_fire_failure_counter_default_reason_is_stage_error(self, mocker) -> None:
-        obj, prom = _make_omni_base_with_mock_prom(mocker)
-        obj.request_states["req-1"] = SimpleNamespace(
-            metrics=SimpleNamespace(e2e_done=set()),
-            failure_recorded=False,
-        )
-
-        obj._fire_failure_counter_if_alive("req-1")
-
-        prom.inc_requests_failed.assert_called_once_with("stage_error")
 
     def test_fire_failure_counter_normalizes_unrecognized_reason(self, mocker) -> None:
         obj, prom = _make_omni_base_with_mock_prom(mocker)
@@ -83,7 +72,7 @@ class TestFailureCounterWiring:
             failure_recorded=False,
         )
 
-        obj._fire_failure_counter_if_alive("req-1", reason="CUDA error for req-1")
+        obj._record_request_failure_once("req-1", reason="CUDA error for req-1")
 
         prom.inc_requests_failed.assert_called_once_with("unknown")
 
@@ -96,7 +85,7 @@ class TestFailureCounterWiring:
             failure_recorded=False,
         )
 
-        obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
+        obj._record_request_failure_once("req-1", reason="client_disconnect")
 
         prom.request_failed.assert_not_called()
         prom.inc_requests_failed.assert_not_called()
@@ -106,7 +95,7 @@ class TestFailureCounterWiring:
         # must NOT raise.
         obj, prom = _make_omni_base_with_mock_prom(mocker)
 
-        obj._fire_failure_counter_if_alive("missing-req", reason="oom")
+        obj._record_request_failure_once("missing-req", reason="oom")
 
         prom.request_failed.assert_not_called()
         prom.inc_requests_failed.assert_not_called()
@@ -121,7 +110,7 @@ class TestFailureCounterWiring:
             failure_recorded=False,
         )
 
-        obj._fire_failure_counter_if_alive("req-1", reason="client_disconnect")
+        obj._record_request_failure_once("req-1", reason="client_disconnect")
         obj._log_summary_and_cleanup("req-1", reason="stage_error")
 
         prom.request_failed.assert_called_once()

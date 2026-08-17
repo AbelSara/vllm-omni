@@ -423,9 +423,6 @@ class OmniBase(PDDisaggregationMixin):
         prom.request_failed()
         prom.inc_requests_failed(_normalize_failure_reason(reason))
 
-    def _fire_failure_counter_if_alive(self, request_id: str, reason: str = "stage_error") -> None:
-        self._record_request_failure_once(request_id, reason)
-
     def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
         try:

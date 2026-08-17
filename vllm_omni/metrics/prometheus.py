@@ -153,8 +153,6 @@ class OmniPrometheusMetrics:
     def request_failed(self) -> None:
         if not self._log_stats:
             return
-        # Pipeline-level "fail" maps to the upstream FinishReason.ABORT bucket;
-        # a single counter family now covers both normal stops and aborts.
         _completion_family.labels(
             model_name=self._model_name,
             finished_reason="abort",
@@ -191,9 +189,6 @@ class OmniPrometheusMetrics:
         ).set(max(n_waiting, 0))
 
     def observe_num_inference_steps(self, n_steps: int) -> None:
-        # Guard ``<= 0`` (not ``< 0``) so text stages contributing zero
-        # steps don't pollute the diffusion histogram — the per-stage finish
-        # block in _process_single_result calls this unconditionally.
         if not self._log_stats or n_steps <= 0:
             return
         self._num_inference_steps.observe(n_steps)
@@ -204,8 +199,6 @@ class OmniPrometheusMetrics:
         self._image_count.inc(n_images)
 
     def observe_image_pixels(self, n_pixels: int) -> None:
-        # Guard ``<= 0`` so text stages contributing zero pixels don't
-        # pollute the image histogram — see observe_num_inference_steps.
         if not self._log_stats or n_pixels <= 0:
             return
         self._image_pixels.observe(n_pixels)
@@ -217,9 +210,6 @@ class OmniPrometheusMetrics:
             model_name=self._model_name,
             stage=str(stage),
         ).set(max(peak_memory_mb, 0.0))
-
-    # Failure / KV transfer families. diffusion_forward_s lives on
-    # OmniModalityMetrics (rides _observe_diffusion_finalize).
 
     def inc_requests_failed(self, reason: str) -> None:
         if not self._log_stats:
