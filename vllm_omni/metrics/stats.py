@@ -574,10 +574,6 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
-        # Preserve float for seconds-bearing keys, int for everything else so
-        # the log table doesn't render counts as ``1.0`` / ``2.0``. The
-        # accumulator already converted engine-side ``_ms`` emits to ``_s``
-        # keys via ``_MS_TO_S``.
         stats.diffusion_metrics = (
             {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
