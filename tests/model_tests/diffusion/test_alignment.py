@@ -74,12 +74,14 @@ EXCLUDED_MODELS = [
     "Cosmos3OmniPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamImagePipeline",
+    "HiDreamO1ImagePipeline",
     "DreamZeroPipeline",
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
     "SoulXSingerPipeline",
     "SoulXSingerSVCPipeline",
+    "SanaWmPipeline",
 ]
 
 
