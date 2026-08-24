@@ -40,7 +40,6 @@ EXCLUDED_MODELS = [
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
     "WanI2VDMD2Pipeline",
-    "LongCatImagePipeline",
     "LongCatVideoAvatarPipeline",
     "BagelPipeline",
     "BooguImagePipeline",
@@ -60,7 +59,6 @@ EXCLUDED_MODELS = [
     "HeliosPyramidPipeline",
     "DreamIDOmniPipeline",
     "SenseNovaU1Pipeline",
-    "AudioXPipeline",
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
@@ -79,8 +77,6 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
-    "SoulXSingerPipeline",
-    "SoulXSingerSVCPipeline",
     "SanaWmPipeline",
 ]
 
