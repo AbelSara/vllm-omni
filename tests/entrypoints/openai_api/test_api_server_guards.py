@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """API-server surface guards for the OpenAI Omni entrypoint.
 
 Purpose
@@ -703,9 +703,12 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     stage = SimpleNamespace(engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
 
+    factory_kwargs = {}
+
     def _for_diffusion_factory(label: str):
         @classmethod
         def _factory(cls, *args, **kwargs):
+            factory_kwargs[label] = kwargs
             return _marker(label)
 
         return _factory
@@ -728,7 +731,14 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(
+            allowed_local_media_path="/allowed/media",
+            allowed_media_domains=["media.example.com"],
+        ),
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -737,6 +747,8 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+    assert factory_kwargs["speech"]["allowed_local_media_path"] == "/allowed/media"
+    assert factory_kwargs["speech"]["allowed_media_domains"] == ["media.example.com"]
 
 
 @pytest.mark.asyncio
