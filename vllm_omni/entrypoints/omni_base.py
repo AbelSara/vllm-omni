@@ -33,7 +33,11 @@ from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.metrics.transfer import OmniTransferMetrics
-from vllm_omni.metrics.utils import normalize_failure_reason
+from vllm_omni.metrics.utils import (
+    extract_queue_wait_s,
+    normalize_failure_reason,
+    observe_stage_workload_metrics,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
@@ -42,26 +46,6 @@ if TYPE_CHECKING:
     from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
-
-
-def _extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
-    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
-        return None
-    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
-
-
-def _observe_stage_workload_metrics(
-    prom_metrics: OmniPrometheusMetrics,
-    *,
-    stage_type: str,
-    stage_metrics: StageRequestStats,
-) -> None:
-    if stage_type == "diffusion":
-        prom_metrics.observe_num_inference_steps(stage_metrics.num_inference_steps)
-
-    if stage_metrics.output_unit_type == "image":
-        prom_metrics.observe_image_pixels(stage_metrics.image_pixels)
-        prom_metrics.inc_image_count(stage_metrics.output_unit_count)
 
 
 class OmniEngineDeadError(EngineDeadError):
@@ -651,7 +635,7 @@ class OmniBase(PDDisaggregationMixin):
                     stage_meta.stage_type,
                     _m.stage_gen_time_ms / 1000.0,
                 )
-                _observe_stage_workload_metrics(
+                observe_stage_workload_metrics(
                     self.prom_metrics,
                     stage_type=stage_meta.stage_type,
                     stage_metrics=_m,
@@ -701,7 +685,7 @@ class OmniBase(PDDisaggregationMixin):
                     _gen_tok += int(evt.num_tokens_out)
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
 
-                queue_wait_s = _extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
+                queue_wait_s = extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
                 if queue_wait_s is not None:
                     self.prom_metrics.observe_queue_wait(queue_wait_s)
 

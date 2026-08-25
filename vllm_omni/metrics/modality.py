@@ -27,7 +27,7 @@ from typing import Any
 from prometheus_client import Counter, Histogram
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import count_audio_frames, extract_mm_output
+from vllm_omni.metrics.utils import observe_audio_finalize, observe_diffusion_finalize
 
 _stage_labels = list(defs.STAGE_LABELS)
 
@@ -288,7 +288,7 @@ def observe_modality_at_finalize(
     if replica_id is None or stage_metrics is None:
         return
 
-    _observe_diffusion_finalize(
+    observe_diffusion_finalize(
         mod_metrics,
         stage_id=stage_id,
         replica_id=replica_id,
@@ -296,100 +296,13 @@ def observe_modality_at_finalize(
     )
 
     if output_type == "audio":
-        _observe_audio_finalize(
+        observe_audio_finalize(
             mod_metrics,
             stage_id=stage_id,
             replica_id=replica_id,
             stage_metrics=stage_metrics,
             engine_outputs=engine_outputs,
         )
-
-
-def _observe_audio_finalize(
-    mod_metrics: OmniModalityMetrics,
-    *,
-    stage_id: int,
-    replica_id: int,
-    stage_metrics: Any,
-    engine_outputs: Any,
-) -> None:
-    stage_label = str(stage_id)
-    replica_label = str(replica_id)
-    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
-    mm_out = extract_mm_output(engine_outputs)
-
-    sample_rate = defs.resolve_audio_sample_rate(mm_out)
-    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-    if n_frames == 0:
-        n_frames = count_audio_frames(mm_out)
-    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-    if duration_s > 0:
-        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-        mod_metrics.observe_audio_rtf(
-            stage_label,
-            replica_label,
-            defs.compute_audio_rtf(gen_time_s, duration_s),
-        )
-    else:
-        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-
-
-_DIFFUSION_EXEC_KEY = "diffusion_engine_exec_time_s"
-_DIFFUSION_PREPROCESS_KEY = "preprocess_time_s"
-_DIFFUSION_POSTPROCESS_KEY = "postprocess_time_s"
-_VAE_DECODE_KEY = "vae_decode_time_s"
-_DIFFUSION_FORWARD_KEY = "forward_time_s"
-_DIFFUSION_KV_LOAD_KEY = "kv_recv_time_s"
-
-
-def _observe_diffusion_finalize(
-    mod_metrics: OmniModalityMetrics,
-    *,
-    stage_id: int,
-    replica_id: int,
-    stage_metrics: Any,
-) -> None:
-    diff_metrics = getattr(stage_metrics, "diffusion_metrics", None)
-    if not diff_metrics:
-        return
-
-    stage_label = str(stage_id)
-    replica_label = str(replica_id)
-
-    exec_s = diff_metrics.get(_DIFFUSION_EXEC_KEY)
-    if exec_s is not None:
-        mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
-        num_steps = int(
-            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
-        )
-        if num_steps > 0:
-            mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
-
-    pre_s = diff_metrics.get(_DIFFUSION_PREPROCESS_KEY)
-    if pre_s is not None:
-        mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
-
-    post_s = diff_metrics.get(_DIFFUSION_POSTPROCESS_KEY)
-    if post_s is not None:
-        mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
-
-    vae_s = diff_metrics.get(_VAE_DECODE_KEY)
-    if vae_s is not None:
-        mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
-
-    forward_s = diff_metrics.get(_DIFFUSION_FORWARD_KEY)
-    if forward_s is not None:
-        mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
-        num_steps = int(
-            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
-        )
-        if num_steps > 0 and getattr(stage_metrics, "output_unit_type", None) == "image":
-            mod_metrics.observe_denoise_step_latency(stage_label, replica_label, float(forward_s) / num_steps)
-
-    kv_load_s = diff_metrics.get(_DIFFUSION_KV_LOAD_KEY)
-    if kv_load_s is not None:
-        mod_metrics.observe_diffusion_kv_load(stage_label, replica_label, float(kv_load_s))
 
 
 def observe_audio_first_packet(
