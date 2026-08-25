@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Orchestrator for vLLM-Omni multi-stage runtime.
 
@@ -56,6 +59,7 @@ from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -543,6 +547,7 @@ class Orchestrator:
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()
 
@@ -964,6 +969,10 @@ class Orchestrator:
                                 n_waiting = output_metrics.pop(metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY, None)
                                 if n_waiting is not None:
                                     self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
+
+                            if diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID:
+                                idle = False
+                                continue
 
                             pool.record_output_timestamps([diffusion_output])
                             processed = [diffusion_output]

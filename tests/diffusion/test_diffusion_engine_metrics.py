@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Source-level regression tests for diffusion output/engine helpers.
 
 These tests verify naming conventions and patterns by inspecting source code
@@ -35,6 +35,46 @@ _FORMATTER_PATH = os.path.normpath(
         "vllm_omni",
         "diffusion",
         "output_formatter.py",
+    )
+)
+_METRICS_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "vllm_omni",
+        "metrics",
+        "utils.py",
+    )
+)
+_INLINE_CLIENT_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "vllm_omni",
+        "diffusion",
+        "inline_stage_diffusion_client.py",
+    )
+)
+_STAGE_PROC_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "vllm_omni",
+        "diffusion",
+        "stage_diffusion_proc.py",
+    )
+)
+_ORCHESTRATOR_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        os.pardir,
+        os.pardir,
+        "vllm_omni",
+        "engine",
+        "orchestrator.py",
     )
 )
 
@@ -108,8 +148,36 @@ class TestMetricKeys:
     def test_step_streaming_piggybacks_scheduler_waiting_snapshot(self) -> None:
         source = _read_source(_ENGINE_PATH)
         step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
-        assert "DIFFUSION_SCHEDULER_WAITING_KEY" in step_streaming_source
+        assert "diffusion_scheduler_waiting_metrics(" in step_streaming_source
         assert "_scheduler_num_waiting_reqs" in step_streaming_source
+
+    def test_step_streaming_preserves_snapshot_on_postprocess_error(self) -> None:
+        source = _read_source(_ENGINE_PATH)
+        step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
+        assert "scheduler_metrics = diffusion_scheduler_waiting_metrics(" in step_streaming_source
+        assert 'setattr(exc, "diffusion_metrics", scheduler_metrics)' in step_streaming_source
+        assert step_streaming_source.index("scheduler_metrics =") < step_streaming_source.index(
+            "self.postprocess_output("
+        )
+
+    def test_abort_keeps_output_consumers_alive_for_terminal_snapshot(self) -> None:
+        inline_source = _read_source(_INLINE_CLIENT_PATH)
+        abort_source = _get_function_source(inline_source, "InlineStageDiffusionClient", "abort_requests_async")
+        assert ".cancel(" not in abort_source
+
+        proc_source = _read_source(_STAGE_PROC_PATH)
+        run_loop_source = _get_function_source(proc_source, "StageDiffusionProc", "run_loop")
+        abort_branch = run_loop_source[run_loop_source.index('elif msg_type == "abort":') :]
+        abort_branch = abort_branch[: abort_branch.index('elif msg_type == "collective_rpc":')]
+        assert ".cancel(" not in abort_branch
+
+    def test_orchestrator_consumes_metrics_only_output_without_routing(self) -> None:
+        source = _read_source(_ORCHESTRATOR_PATH)
+        loop_source = _get_function_source(source, "Orchestrator", "_orchestration_loop")
+        snapshot_pos = loop_source.index("_update_stage_replica_waiting(")
+        sentinel_pos = loop_source.index("diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID")
+        route_pos = loop_source.index("pool.record_output_timestamps([diffusion_output])")
+        assert snapshot_pos < sentinel_pos < route_pos
 
 
 class TestVaeDecodeEmit:
@@ -119,16 +187,15 @@ class TestVaeDecodeEmit:
     """
 
     def test_extract_vae_decode_ms_helper_exists(self) -> None:
-        source = _read_source(_ENGINE_PATH)
-        helper_src = _get_function_source(source, None, "_extract_vae_decode_ms")
+        source = _read_source(_METRICS_PATH)
+        helper_src = _get_function_source(source, None, "extract_diffusion_vae_decode_ms")
         assert ".vae.decode" in helper_src, "helper must key on the '.vae.decode' suffix"
-        assert "stage_durations" in helper_src, "helper must read from output.stage_durations"
 
     def test_step_streaming_emits_vae_decode_time_ms(self) -> None:
         source = _read_source(_ENGINE_PATH)
         step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
-        assert "_extract_vae_decode_ms(" in step_streaming_source, (
-            "step_streaming must call _extract_vae_decode_ms to source VAE decode timing"
+        assert "extract_diffusion_vae_decode_ms(" in step_streaming_source, (
+            "step_streaming must call extract_diffusion_vae_decode_ms to source VAE decode timing"
         )
         assert '"vae_decode_time_ms"' in step_streaming_source, (
             "step_streaming must emit vae_decode_time_ms key for the _MS_TO_S accumulator"
@@ -139,16 +206,15 @@ class TestDiffuseForwardEmit:
     """Forward-only timing → forward_time_ms, mirroring TestVaeDecodeEmit."""
 
     def test_extract_diffuse_ms_helper_exists(self) -> None:
-        source = _read_source(_ENGINE_PATH)
-        helper_src = _get_function_source(source, None, "_extract_diffuse_ms")
+        source = _read_source(_METRICS_PATH)
+        helper_src = _get_function_source(source, None, "extract_diffusion_denoise_ms")
         assert ".diffuse" in helper_src, "helper must key on the '.diffuse' suffix"
-        assert "stage_durations" in helper_src, "helper must read from output.stage_durations"
 
     def test_step_streaming_emits_forward_time_ms(self) -> None:
         source = _read_source(_ENGINE_PATH)
         step_streaming_source = _get_function_source(source, "DiffusionEngine", "step_streaming")
-        assert "_extract_diffuse_ms(" in step_streaming_source, (
-            "step_streaming must call _extract_diffuse_ms to source forward-only timing"
+        assert "extract_diffusion_denoise_ms(" in step_streaming_source, (
+            "step_streaming must call extract_diffusion_denoise_ms to source forward-only timing"
         )
         assert '"forward_time_ms"' in step_streaming_source, (
             "step_streaming must emit forward_time_ms key for the _MS_TO_S accumulator"

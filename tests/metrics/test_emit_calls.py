@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Verify emit-call wiring in production code paths.
 
 Uses behavior and Prometheus exposition to verify production call semantics.
@@ -43,15 +46,15 @@ class TestFailureCounterWiring:
     """All failure paths share one request-idempotent counter helper."""
 
     def test_failure_reason_taxonomy_is_bounded(self) -> None:
-        from vllm_omni.entrypoints.omni_base import _normalize_failure_reason
+        from vllm_omni.metrics.utils import normalize_failure_reason
 
-        assert _normalize_failure_reason("client_abort") == "client_abort"
-        assert _normalize_failure_reason("client_disconnect") == "client_disconnect"
-        assert _normalize_failure_reason("stage_error") == "stage_error"
-        assert _normalize_failure_reason("unknown") == "unknown"
-        assert _normalize_failure_reason("timeout for request req-1") == "unknown"
-        assert _normalize_failure_reason("") == "unknown"
-        assert _normalize_failure_reason(None) == "unknown"
+        assert normalize_failure_reason("client_abort") == "client_abort"
+        assert normalize_failure_reason("client_disconnect") == "client_disconnect"
+        assert normalize_failure_reason("stage_error") == "stage_error"
+        assert normalize_failure_reason("unknown") == "unknown"
+        assert normalize_failure_reason("timeout for request req-1") == "unknown"
+        assert normalize_failure_reason("") == "unknown"
+        assert normalize_failure_reason(None) == "unknown"
 
     def test_fire_failure_counter_passes_reason_through(self, mocker) -> None:
         obj, prom = _make_omni_base_with_mock_prom(mocker)
