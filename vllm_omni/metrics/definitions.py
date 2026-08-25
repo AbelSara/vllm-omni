@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Single source of truth for vLLM-Omni Prometheus + bench CLI metric naming.
 
 Consumed by:
@@ -92,6 +95,7 @@ POSTPROCESS_TIME_MS = f"{POSTPROCESS_TIME}_ms"
 POSTPROCESS_TIMES_MS = f"{POSTPROCESS_TIME}s_ms"
 OUTPUT_UNIT_COUNT = "output_unit_count"
 SERVING_TIME_TO_FIRST_OUTPUT_MS = "serving_time_to_first_output_ms"
+IMAGE_TIME_TO_FIRST_OUTPUT_MS = "image_time_to_first_output_ms"
 SERVING_TIME_TO_FIRST_OUTPUTS_MS = "serving_time_to_first_outputs_ms"
 TIME_PER_OUTPUT_UNIT_MS = "time_per_output_unit_ms"
 TIME_PER_OUTPUT_UNITS_MS = "time_per_output_units_ms"

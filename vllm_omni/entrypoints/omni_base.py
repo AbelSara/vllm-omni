@@ -666,7 +666,7 @@ class OmniBase(PDDisaggregationMixin):
                         self.mod_metrics.observe_image_ttfp(
                             str(stage_id),
                             str(result.replica_id),
-                            _m.serving_time_to_first_output_ms / 1000.0,
+                            _m.image_time_to_first_output_ms / 1000.0,
                         )
 
         if not stage_meta.final_output:

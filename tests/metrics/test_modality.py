@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -376,6 +379,35 @@ class TestObserveModalityAtFinalize:
             engine_outputs=_Bag(),
         )
         assert not any(c[0] == "observe_denoise_step_latency" for c in stub.calls)
+
+    def test_stage_snapshot_keeps_forward_based_denoise_latency(self):
+        aggregator = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=0.0,
+            final_stage_id_for_e2e=0,
+        )
+        aggregator.diffusion_metrics["req-image"]["forward_time_s"] = 0.8
+        stage_metrics = _Bag(
+            stage_id=None,
+            request_id=None,
+            final_output_type=None,
+            num_tokens_in=0,
+            num_tokens_out=0,
+            stage_gen_time_ms=1200.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=_Bag(),
+            diffusion_metrics=None,
+            num_inference_steps=20,
+            output_unit_type="image",
+            denoise_step_latency_ms=0.0,
+        )
+
+        stats = aggregator._as_stage_request_stats(0, "req-image", stage_metrics, "image")
+
+        assert stats.denoise_step_latency_ms == pytest.approx(40.0)
 
     def test_diffusion_per_step_skipped_without_num_inference_steps(self):
         stub = _StubModMetrics()
