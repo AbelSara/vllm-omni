@@ -31,7 +31,7 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_st
 from vllm_omni.errors import raise_client_error_or
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
-from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
+from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.metrics.utils import (
     extract_queue_wait_s,
