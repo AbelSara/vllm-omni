@@ -396,9 +396,10 @@ class OmniBase(PDDisaggregationMixin):
     def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
-        if req_state is None or req_state.metrics is None or prom is None:
+        metrics = getattr(req_state, "metrics", None)
+        if metrics is None or prom is None:
             return
-        if str(request_id) in req_state.metrics.e2e_done or getattr(req_state, "failure_recorded", False):
+        if str(request_id) in metrics.e2e_done or getattr(req_state, "failure_recorded", False):
             return
 
         req_state.failure_recorded = True
