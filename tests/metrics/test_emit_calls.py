@@ -188,15 +188,15 @@ class TestCounterExpositionNames:
 
 class TestQueueWaitExtraction:
     def test_present_zero_is_a_valid_observation(self) -> None:
-        from vllm_omni.entrypoints.omni_base import _extract_queue_wait_s
+        from vllm_omni.metrics.utils import extract_queue_wait_s
 
-        assert _extract_queue_wait_s({"queue_wait_ms": 0.0}) == 0.0
+        assert extract_queue_wait_s({"queue_wait_ms": 0.0}) == 0.0
 
     def test_missing_queue_wait_is_not_synthetic_zero(self) -> None:
-        from vllm_omni.entrypoints.omni_base import _extract_queue_wait_s
+        from vllm_omni.metrics.utils import extract_queue_wait_s
 
-        assert _extract_queue_wait_s({"preprocess_ms": 2.0}) is None
-        assert _extract_queue_wait_s(None) is None
+        assert extract_queue_wait_s({"preprocess_ms": 2.0}) is None
+        assert extract_queue_wait_s(None) is None
 
 
 class TestStageInQueueObservation:
@@ -216,7 +216,7 @@ class TestStageInQueueObservation:
 class TestStageWorkloadMetricScope:
     @staticmethod
     def _observe(mocker, *, stage_type: str, output_unit_type: str):
-        from vllm_omni.entrypoints.omni_base import _observe_stage_workload_metrics
+        from vllm_omni.metrics.utils import observe_stage_workload_metrics
 
         prom = mocker.Mock(spec=OmniPrometheusMetrics)
         stage_metrics = SimpleNamespace(
@@ -225,7 +225,7 @@ class TestStageWorkloadMetricScope:
             image_pixels=1024 * 1024,
             output_unit_count=2,
         )
-        _observe_stage_workload_metrics(
+        observe_stage_workload_metrics(
             prom,
             stage_type=stage_type,
             stage_metrics=stage_metrics,
