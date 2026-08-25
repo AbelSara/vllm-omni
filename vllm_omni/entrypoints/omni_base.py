@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -30,6 +33,7 @@ from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.metrics.transfer import OmniTransferMetrics
+from vllm_omni.metrics.utils import normalize_failure_reason
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
@@ -38,12 +42,6 @@ if TYPE_CHECKING:
     from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
 
 logger = init_logger(__name__)
-
-_FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
-
-
-def _normalize_failure_reason(reason: str | None) -> str | None:
-    return reason if reason in _FAILURE_REASONS else "unknown"
 
 
 def _extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
@@ -421,7 +419,7 @@ class OmniBase(PDDisaggregationMixin):
 
         req_state.failure_recorded = True
         prom.request_failed()
-        prom.inc_requests_failed(_normalize_failure_reason(reason))
+        prom.inc_requests_failed(normalize_failure_reason(reason))
 
     def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)

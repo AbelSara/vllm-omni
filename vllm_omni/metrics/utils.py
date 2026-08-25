@@ -1,8 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
 from typing import Any
 
 from prettytable import PrettyTable
+
+from vllm_omni.metrics import definitions as metric_defs
+
+FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
+DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
+
+
+def normalize_failure_reason(reason: str | None) -> str:
+    """Map request failure details to the bounded metrics taxonomy."""
+    return reason if reason in FAILURE_REASONS else "unknown"
+
+
+def diffusion_scheduler_waiting_metrics(n_waiting: int) -> dict[str, int]:
+    """Build the diffusion scheduler snapshot consumed by the orchestrator."""
+    return {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: max(int(n_waiting), 0)}
+
+
+def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
+    """Return metrics attached to a terminal diffusion error."""
+    metrics = getattr(exc, "diffusion_metrics", None)
+    return dict(metrics) if isinstance(metrics, dict) else {}
+
+
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+    """Sum matching diffusion stage durations in milliseconds."""
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, dict):
+        return None
+
+    total = 0.0
+    found = False
+    for key, value in durations.items():
+        if not key.endswith(suffix):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total * 1000.0 if found else None
+
+
+def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
+    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+
+
+def extract_diffusion_denoise_ms(output: Any) -> float | None:
+    """Extract denoise-loop time (transformer and per-step scheduler)."""
+    return sum_diffusion_stage_durations_ms(output, ".diffuse")
 
 
 def coerce_positive_int_scalar(value: object) -> int | None:

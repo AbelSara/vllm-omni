@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -56,7 +56,11 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.metrics import definitions as metric_defs
+from vllm_omni.metrics.utils import (
+    diffusion_scheduler_waiting_metrics,
+    extract_diffusion_denoise_ms,
+    extract_diffusion_vae_decode_ms,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
@@ -187,37 +191,6 @@ def _move_tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_move_tensor_tree_to_cpu(item) for item in value)
     return value
-
-
-def _sum_stage_durations_ms(output: Any, suffix: str) -> float | None:
-    """Sum ``stage_durations`` values for keys ending in ``suffix`` (→ ms).
-
-    Returns ``None`` when no key matches (profiler off) so callers skip the
-    emit rather than observe a zero sample.
-    """
-    durations = getattr(output, "stage_durations", None)
-    if not isinstance(durations, dict):
-        return None
-    total = 0.0
-    found = False
-    for key, value in durations.items():
-        if not key.endswith(suffix):
-            continue
-        try:
-            total += float(value)
-            found = True
-        except (TypeError, ValueError):
-            continue
-    return total * 1000.0 if found else None
-
-
-def _extract_vae_decode_ms(output: Any) -> float | None:
-    return _sum_stage_durations_ms(output, ".vae.decode")
-
-
-def _extract_diffuse_ms(output: Any) -> float | None:
-    # .diffuse = the denoise loop (transformer forward + per-step scheduler).
-    return _sum_stage_durations_ms(output, ".diffuse")
 
 
 @dataclass
@@ -479,7 +452,14 @@ class DiffusionEngine:
                     )
                     raise
             postprocess_start_time = time.perf_counter()
-            formatted_outputs = self.postprocess_output(request, output)
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(self._scheduler_num_waiting_reqs)
+            try:
+                formatted_outputs = self.postprocess_output(request, output)
+            except Exception as exc:
+                # Preserve the latest scheduler snapshot across terminal
+                # abort/error paths, which do not produce formatted outputs.
+                setattr(exc, "diffusion_metrics", scheduler_metrics)
+                raise
             postprocess_time = time.perf_counter() - postprocess_start_time
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
@@ -495,14 +475,14 @@ class DiffusionEngine:
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
-                    metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: self._scheduler_num_waiting_reqs,
+                    **scheduler_metrics,
                 }
                 if request.scheduler_queue_wait_ms is not None:
                     metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
-                vae_decode_ms = _extract_vae_decode_ms(output)
+                vae_decode_ms = extract_diffusion_vae_decode_ms(output)
                 if vae_decode_ms is not None:
                     metrics_update["vae_decode_time_ms"] = vae_decode_ms
-                forward_ms = _extract_diffuse_ms(output)
+                forward_ms = extract_diffusion_denoise_ms(output)
                 if forward_ms is not None:
                     metrics_update["forward_time_ms"] = forward_ms
                 kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
