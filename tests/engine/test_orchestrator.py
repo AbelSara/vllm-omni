@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -2055,6 +2058,7 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     metrics = pool.build_stage_metrics(
         [output],
         submit_ts=time.time(),
+        request_timestamp=time.time(),
         replica_id=0,
     )
 
@@ -2062,7 +2066,7 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     assert metrics.output_unit_count == 3
 
 
-def test_image_ttfo_uses_stage_submit_time() -> None:
+def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     pool = StagePool(
         1,
@@ -2076,10 +2080,12 @@ def test_image_ttfo_uses_stage_submit_time() -> None:
     metrics = pool.build_stage_metrics(
         [output],
         submit_ts=130.0,
+        request_timestamp=120.0,
         replica_id=0,
     )
 
-    assert metrics.serving_time_to_first_output_ms == pytest.approx(2000.0)
+    assert metrics.serving_time_to_first_output_ms == pytest.approx(12000.0)
+    assert metrics.image_time_to_first_output_ms == pytest.approx(2000.0)
 
 
 @pytest.mark.asyncio

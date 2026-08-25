@@ -284,6 +284,7 @@ class TestStageWorkloadMetricScope:
             image_pixels=1024 * 1024,
             output_unit_count=1,
             serving_time_to_first_output_ms=250.0,
+            image_time_to_first_output_ms=250.0,
             pipeline_timings={},
         )
         result = SimpleNamespace(

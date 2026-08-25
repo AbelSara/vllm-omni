@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import time
@@ -50,10 +53,12 @@ class StageRequestStats:
     audio_duration_s: float = 0.0
     image_pixels: int = 0
     num_inference_steps: int = 0
+    denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
     output_unit_type: str | None = None
     output_unit_count: int = 0
     serving_time_to_first_output_ms: float = 0.0
+    image_time_to_first_output_ms: float = 0.0
     time_per_output_unit_ms: float = 0.0
     inter_output_latency_ms: float = 0.0
     inter_output_latencies_ms: list[float] | None = None
@@ -476,9 +481,11 @@ class OrchestratorAggregator:
                 defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
                 f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
                 defs.IMAGE_PIXELS: int(evt.image_pixels),
+                defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
                 "output_unit_type": evt.output_unit_type,
                 defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
                 defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
+                defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS: float(evt.image_time_to_first_output_ms),
                 defs.TIME_PER_OUTPUT_UNIT_MS: float(evt.time_per_output_unit_ms),
                 defs.INTER_OUTPUT_LATENCY_MS: float(evt.inter_output_latency_ms),
                 defs.INTER_OUTPUT_LATENCIES_MS: list(evt.inter_output_latencies_ms or []),
@@ -502,12 +509,20 @@ class OrchestratorAggregator:
             evt.audio_duration_s
         )
         current[defs.IMAGE_PIXELS] = int(current.get(defs.IMAGE_PIXELS, 0)) + int(evt.image_pixels)
+        denoise_step_latency_ms = float(evt.denoise_step_latency_ms)
+        if denoise_step_latency_ms > 0:
+            current[defs.DENOISE_STEP_LATENCY_MS] = denoise_step_latency_ms
         current[defs.OUTPUT_UNIT_COUNT] = int(current.get(defs.OUTPUT_UNIT_COUNT, 0)) + int(evt.output_unit_count)
 
         first_output_ms = float(evt.serving_time_to_first_output_ms)
         current_first_output_ms = float(current.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS, 0.0))
         if current_first_output_ms <= 0 < first_output_ms:
             current[defs.SERVING_TIME_TO_FIRST_OUTPUT_MS] = first_output_ms
+
+        image_first_output_ms = float(evt.image_time_to_first_output_ms)
+        current_image_first_output_ms = float(current.get(defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS, 0.0))
+        if current_image_first_output_ms <= 0 < image_first_output_ms:
+            current[defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS] = image_first_output_ms
 
         if evt.output_unit_type:
             current["output_unit_type"] = evt.output_unit_type
@@ -579,6 +594,9 @@ class OrchestratorAggregator:
             if req_id in self.diffusion_metrics
             else None
         )
+        forward_time_s = (stats.diffusion_metrics or {}).get("forward_time_s")
+        if forward_time_s is not None and stats.num_inference_steps > 0 and stats.output_unit_type == "image":
+            stats.denoise_step_latency_ms = float(forward_time_s) * 1000.0 / stats.num_inference_steps
         return stats
 
     def on_stage_metrics(
