@@ -452,7 +452,7 @@ class DiffusionEngine:
                     )
                     raise
             postprocess_start_time = time.perf_counter()
-            scheduler_metrics = diffusion_scheduler_waiting_metrics(self._scheduler_num_waiting_reqs)
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
                 formatted_outputs = self.postprocess_output(request, output)
             except Exception as exc:

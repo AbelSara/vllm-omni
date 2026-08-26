@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
 from vllm_omni.metrics import OmniPrometheusMetrics
 from vllm_omni.metrics import definitions as defs
+
+if TYPE_CHECKING:
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -415,11 +419,14 @@ class TestZeroGuardContract:
 # ---------------------------------------------------------------------------
 
 
-def _make_scheduler_shell() -> object:
+def _make_scheduler_shell() -> OmniARScheduler:
     """Minimal OmniARScheduler shell — skips upstream __init__ via object.__new__."""
     from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 
     obj = object.__new__(OmniARScheduler)
+    obj.requests = {}
+    obj.running = []
+    obj.waiting = []
     obj._kv_wait_start_ts = {}
     obj._omni_kv_config = None
     return obj
@@ -467,15 +474,11 @@ class TestKvWaitSchedulerEmit:
 
 
 class TestKvWaitTerminalCleanup:
-    def test_finish_requests_clears_requested_wait_only(self, mocker) -> None:
+    def test_finish_requests_clears_requested_wait_only(self) -> None:
         from vllm.v1.request import RequestStatus
 
-        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-        from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-
-        scheduler = object.__new__(OmniARScheduler)
+        scheduler = _make_scheduler_shell()
         scheduler._kv_wait_start_ts = {"req-1": 10.0, "req-2": 20.0}
-        parent_finish = mocker.patch.object(OmniSchedulerMixin, "finish_requests", return_value=[])
 
         finished = scheduler.finish_requests(
             (request_id for request_id in ["req-1"]),
@@ -485,19 +488,12 @@ class TestKvWaitTerminalCleanup:
         assert finished == []
         assert "req-1" not in scheduler._kv_wait_start_ts
         assert scheduler._kv_wait_start_ts["req-2"] == 20.0
-        parent_finish.assert_called_once()
 
-    def test_cleanup_is_idempotent_when_timestamp_is_already_gone(self, mocker) -> None:
+    def test_cleanup_is_idempotent_when_timestamp_is_already_gone(self) -> None:
         from vllm.v1.request import RequestStatus
 
-        from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-        from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-
-        scheduler = object.__new__(OmniARScheduler)
-        scheduler._kv_wait_start_ts = {}
-        parent_finish = mocker.patch.object(OmniSchedulerMixin, "finish_requests", return_value=[])
+        scheduler = _make_scheduler_shell()
 
         scheduler.finish_requests("req-already-emitted", RequestStatus.FINISHED_ABORTED)
 
         assert scheduler._kv_wait_start_ts == {}
-        parent_finish.assert_called_once()

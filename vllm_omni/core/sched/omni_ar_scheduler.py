@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -159,8 +159,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _clear_kv_wait_starts(self, request_ids: Iterable[str]) -> None:
         """Drop incomplete KV-wait measurements for terminal requests."""
+        wait_starts = getattr(self, "_kv_wait_start_ts", None)
+        if wait_starts is None:
+            return
         for request_id in request_ids:
-            self._kv_wait_start_ts.pop(request_id, None)
+            wait_starts.pop(request_id, None)
 
     def finish_requests(
         self,
@@ -175,8 +178,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             cleanup_ids = ()
             finish_request_ids = None
         else:
-            cleanup_ids = tuple(request_ids)
-            finish_request_ids = cleanup_ids
+            finish_request_ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
+            cleanup_ids = tuple(finish_request_ids)
 
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
