@@ -589,14 +589,20 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
+        diffusion_metrics_by_request = getattr(self, "diffusion_metrics", None)
         stats.diffusion_metrics = (
-            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
-            if req_id in self.diffusion_metrics
+            {k: float(v) for k, v in diffusion_metrics_by_request.pop(req_id, {}).items()}
+            if diffusion_metrics_by_request is not None and req_id in diffusion_metrics_by_request
             else None
         )
         forward_time_s = (stats.diffusion_metrics or {}).get("forward_time_s")
-        if forward_time_s is not None and stats.num_inference_steps > 0 and stats.output_unit_type == "image":
-            stats.denoise_step_latency_ms = float(forward_time_s) * 1000.0 / stats.num_inference_steps
+        num_inference_steps = int(getattr(stats, "num_inference_steps", 0) or 0)
+        if num_inference_steps > 0 and getattr(stats, "output_unit_type", None) == "image":
+            if forward_time_s is not None:
+                denoise_time_ms = float(forward_time_s) * 1000.0
+            else:
+                denoise_time_ms = float(getattr(stats, "stage_gen_time_ms", 0.0) or 0.0)
+            stats.denoise_step_latency_ms = denoise_time_ms / num_inference_steps
         return stats
 
     def on_stage_metrics(

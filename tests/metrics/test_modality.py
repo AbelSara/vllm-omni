@@ -409,6 +409,24 @@ class TestObserveModalityAtFinalize:
 
         assert stats.denoise_step_latency_ms == pytest.approx(40.0)
 
+    def test_stage_snapshot_falls_back_to_stage_time_without_profiler(self):
+        aggregator = object.__new__(OrchestratorAggregator)
+        stage_metrics = _Bag(
+            stage_id=None,
+            request_id=None,
+            final_output_type=None,
+            stage_gen_time_ms=1200.0,
+            diffusion_metrics=None,
+            num_inference_steps=20,
+            output_unit_type="image",
+            denoise_step_latency_ms=0.0,
+        )
+
+        stats = aggregator._as_stage_request_stats(0, "req-image", stage_metrics, "image")
+
+        assert stats.diffusion_metrics is None
+        assert stats.denoise_step_latency_ms == pytest.approx(60.0)
+
     def test_diffusion_per_step_skipped_without_num_inference_steps(self):
         stub = _StubModMetrics()
         stage_metrics = _Bag(
