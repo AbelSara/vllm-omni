@@ -18,6 +18,8 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
+    _should_warn_missing_token_timing,
+    _stage0_token_timing_diagnostic,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
@@ -266,6 +268,28 @@ def test_stage0_token_count_without_timing_is_not_measured():
     assert output.itl == []
     assert output.text_latency == output.ttft
     assert output.tpot_measured is False
+
+
+def test_stage0_token_timing_diagnostic_is_compact_and_actionable():
+    diagnostic = _stage0_token_timing_diagnostic(
+        [
+            {"output_token_count": 3, "itls_ms": [], "tpot_ms": None},
+            {"output_token_count": 2, "itls_ms": [10.0], "tpot_ms": 10.0},
+        ],
+        expected_output_tokens=5,
+    )
+
+    assert diagnostic == (
+        "expected_tokens=5,observed_tokens=5,stages=["
+        "turn=0:tokens=3,tpot_ms=None,itls_ms_len=0;"
+        "turn=1:tokens=2,tpot_ms=10.0,itls_ms_len=1]"
+    )
+
+
+def test_missing_stage0_token_count_still_warns_when_transcript_exists():
+    output = MixRequestFuncOutput(output_tokens=0, generated_text="generated transcript")
+
+    assert _should_warn_missing_token_timing(output) is True
 
 
 def create_sse_chunk(data_dict):

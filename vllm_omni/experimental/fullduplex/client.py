@@ -288,6 +288,7 @@ class RealtimeEventCollector:
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
         stage0_metrics: dict[str, object] | None = None
+        stage_metric_ids_seen: set[str] = set()
         response_created_at_s: float | None = None
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
@@ -314,6 +315,8 @@ class RealtimeEventCollector:
                 first_text_received_at_s = received_at_s
 
             stage_metrics = _event_stage_metrics(event)
+            if isinstance(stage_metrics, dict):
+                stage_metric_ids_seen.update(map(str, stage_metrics))
             stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
             if isinstance(stage0, dict):
                 stage0_metrics = stage0
@@ -332,6 +335,8 @@ class RealtimeEventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
+        if stage_metric_ids_seen:
+            result["stage_metric_ids_seen"] = sorted(stage_metric_ids_seen)
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_omni.engine.messages import OutputMessage
+from vllm_omni.engine.messages import OutputMessage, StageMetricsMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
@@ -334,6 +334,73 @@ async def test_duplex_request_client_retains_output_route_at_segment_terminal():
 
     assert outputs == [output]
     assert request_states[request_id] is request_state
+
+
+@pytest.mark.asyncio
+async def test_duplex_request_client_merges_standalone_stage_metrics_into_response():
+    request_id = "duplex-sid-e0-stage0"
+    request_state = ClientRequestState(request_id)
+    request_states = {request_id: request_state}
+
+    def stage_metrics(*, tokens: int, output_unit_type: str, tpot_ms: float = 0.0) -> StageRequestStats:
+        return StageRequestStats(
+            batch_id=1,
+            batch_size=1,
+            num_tokens_in=1,
+            num_tokens_out=tokens,
+            stage_gen_time_ms=10.0,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(total_token=tokens, total_gen_time_ms=10.0),
+            output_unit_type=output_unit_type,
+            vllm_ttft_ms=12.0 if output_unit_type == "text" else 0.0,
+            vllm_tpot_ms=tpot_ms,
+            vllm_itl_ms=tpot_ms,
+            vllm_itls_ms=[tpot_ms] if tpot_ms else [],
+        )
+
+    await request_state.queue.put(
+        StageMetricsMessage(
+            request_id=request_id,
+            stage_id=0,
+            metrics=stage_metrics(tokens=3, output_unit_type="text", tpot_ms=9.0),
+        )
+    )
+    output = OmniRequestOutput(
+        request_id=request_id,
+        stage_id=1,
+        final_output_type="audio",
+        finished=True,
+    )
+    await request_state.queue.put(
+        OutputMessage(
+            request_id=request_id,
+            stage_id=1,
+            engine_outputs=output,
+            metrics=stage_metrics(tokens=0, output_unit_type="audio"),
+            finished=True,
+        )
+    )
+    client = DuplexRequestClient(
+        SimpleNamespace(),
+        SimpleNamespace(
+            request_states=request_states,
+            num_stages=2,
+            log_stats=False,
+        ),
+    )
+
+    outputs = await client.collect_outputs(
+        request_id,
+        request_state,
+        response_stage_id=1,
+        timeout=1.0,
+    )
+
+    assert outputs == [output]
+    assert output.metrics["stage_metrics"]["0"]["num_tokens_out"] == 3
+    assert output.metrics["stage_metrics"]["0"]["vllm_tpot_ms"] == 9.0
 
 
 @pytest.mark.asyncio

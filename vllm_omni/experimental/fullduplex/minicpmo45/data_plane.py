@@ -12,6 +12,7 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
 
 logger = init_logger(__name__)
+_TPOT_SERVER_DIAGNOSTIC_KEYS: set[tuple[object, ...]] = set()
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
@@ -596,16 +597,64 @@ def _runtime_result(**values: object) -> dict[str, object]:
     }
 
 
+def _warn_missing_stage_metrics(
+    output: object,
+    metrics: object,
+    *,
+    stage_metrics: object = None,
+) -> None:
+    """Emit one compact diagnostic per missing metric shape."""
+    request_id = getattr(output, "request_id", None)
+    metric_keys = tuple(sorted(map(str, metrics.keys()))) if isinstance(metrics, Mapping) else ()
+    diagnostic_key = (
+        type(metrics).__name__,
+        metric_keys,
+        type(stage_metrics).__name__,
+    )
+    if diagnostic_key in _TPOT_SERVER_DIAGNOSTIC_KEYS:
+        return
+    _TPOT_SERVER_DIAGNOSTIC_KEYS.add(diagnostic_key)
+    logger.warning(
+        "TPOT_SERVER_DIAGNOSTIC request_id=%s output_metrics_type=%s metrics_keys=%s stage_metrics_type=%s",
+        request_id,
+        type(metrics).__name__,
+        list(metric_keys),
+        type(stage_metrics).__name__,
+    )
+
+
 def _output_stage_metrics(output: object) -> dict[str, dict[str, object]] | None:
     metrics = getattr(output, "metrics", None)
     if not isinstance(metrics, Mapping):
+        _warn_missing_stage_metrics(output, metrics)
         return None
     stage_metrics = metrics.get("stage_metrics")
     if not isinstance(stage_metrics, Mapping):
+        _warn_missing_stage_metrics(output, metrics, stage_metrics=stage_metrics)
         return None
     snapshot = {
         str(stage_id): dict(values) for stage_id, values in stage_metrics.items() if isinstance(values, Mapping)
     }
+    if not snapshot:
+        _warn_missing_stage_metrics(output, metrics, stage_metrics=stage_metrics)
+    else:
+        diagnostic_key = (
+            "present",
+            tuple(
+                (stage_id, tuple(sorted(map(str, values.keys()))))
+                for stage_id, values in sorted(snapshot.items())
+            ),
+        )
+        if diagnostic_key not in _TPOT_SERVER_DIAGNOSTIC_KEYS:
+            _TPOT_SERVER_DIAGNOSTIC_KEYS.add(diagnostic_key)
+            logger.warning(
+                "TPOT_SERVER_DIAGNOSTIC request_id=%s stage_metrics_present=%s",
+                getattr(output, "request_id", None),
+                {
+                    stage_id: sorted(map(str, values.keys()))
+                    for stage_id, values in snapshot.items()
+                },
+            )
     return snapshot or None
 
 

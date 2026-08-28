@@ -1492,6 +1492,35 @@ def _nonnegative_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
 
 
+def _stage0_token_timing_diagnostic(raw_stages: list[object], *, expected_output_tokens: int) -> str:
+    """Return a compact, grep-friendly summary for missing Stage 0 timing."""
+    summaries: list[str] = []
+    observed_output_tokens = 0
+    observed_count_complete = True
+    for index, stage in enumerate(raw_stages):
+        if not isinstance(stage, dict):
+            observed_count_complete = False
+            summaries.append(f"turn={index}:type={type(stage).__name__}")
+            continue
+        token_count = stage.get("output_token_count")
+        if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
+            observed_output_tokens += token_count
+        else:
+            observed_count_complete = False
+        itls = stage.get("itls_ms")
+        itls_summary = f"len={len(itls)}" if isinstance(itls, list) else f"type={type(itls).__name__}"
+        summaries.append(
+            f"turn={index}:tokens={token_count!r},tpot_ms={stage.get('tpot_ms')!r},itls_ms_{itls_summary}"
+        )
+    observed = str(observed_output_tokens) if observed_count_complete else "incomplete"
+    return f"expected_tokens={expected_output_tokens},observed_tokens={observed},stages=[{';'.join(summaries)}]"
+
+
+def _should_warn_missing_token_timing(output: MixRequestFuncOutput) -> bool:
+    """Also warn when token counts are absent but a text transcript exists."""
+    return output.output_tokens > 1 or (output.output_tokens == 0 and bool(output.generated_text))
+
+
 def _apply_stage0_token_timings(
     output: MixRequestFuncOutput,
     raw_stages: list[object],
@@ -1609,12 +1638,16 @@ async def _async_request_omniinteract(
             [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
             expected_output_tokens=output.output_tokens,
         )
-        if not token_timing_measured:
-            if output.output_tokens > 1 or (output.output_tokens == 0 and output.generated_text):
-                logger.warning(
-                    "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
-                    case_result.session_id,
-                )
+        if not token_timing_measured and _should_warn_missing_token_timing(output):
+            logger.warning(
+                "TPOT_DIAGNOSTIC OmniInteract session=%s omitted complete engine token timing; %s; "
+                "standard TPOT/ITL are unavailable",
+                case_result.session_id,
+                _stage0_token_timing_diagnostic(
+                    [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
+                    expected_output_tokens=output.output_tokens,
+                ),
+            )
         output.duplex_request_metrics = case_result.duplex_request_metrics
         output.duplex_session_metrics = session_metrics
         output.success = case_result.success
@@ -1788,10 +1821,20 @@ async def async_request_openai_realtime_duplex(
                 [timing.get("stage0_tokens") for timing in turn_timings],
                 expected_output_tokens=output.output_tokens,
             )
-            if not token_timing_measured and output.output_tokens > 1:
+            if not token_timing_measured and _should_warn_missing_token_timing(output):
                 logger.warning(
-                    "Realtime TTS session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                    "TPOT_DIAGNOSTIC Realtime TTS session=%s omitted complete engine token timing; %s; "
+                    "standard TPOT/ITL are unavailable",
                     session_id,
+                    _stage0_token_timing_diagnostic(
+                        [timing.get("stage0_tokens") for timing in turn_timings],
+                        expected_output_tokens=output.output_tokens,
+                    ),
+                )
+                logger.warning(
+                    "TPOT_DIAGNOSTIC Realtime TTS session=%s stage_metric_ids_seen=%s",
+                    session_id,
+                    [timing.get("stage_metric_ids_seen", []) for timing in turn_timings],
                 )
             output.success = True
     except Exception:
