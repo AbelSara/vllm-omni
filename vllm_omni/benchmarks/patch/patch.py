@@ -1653,6 +1653,9 @@ async def async_request_openai_realtime_duplex(
     speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
     if not isinstance(speech_extra, dict):
         speech_extra = {}
+    else:
+        speech_extra = dict(speech_extra)
+    speech_extra["return_stage_metrics"] = True
     configured_turns = getattr(request_func_input, "seed_tts_turns", ())
     turn_prompts = [
         (
