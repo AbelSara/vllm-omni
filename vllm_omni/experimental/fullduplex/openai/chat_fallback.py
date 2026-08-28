@@ -43,19 +43,24 @@ class ChatFallbackProjectorMixin:
             else:
                 await self._emit_full_response(session, result, epoch, response_id, send_json)
             if session.epoch == epoch:
+                final_stage_metrics = session.accumulate_response_stage_metrics(None)
                 should_commit = self._should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit)
                 if should_commit:
                     session.register_history_item(f"item_{response_id}", committed_message)
                 await send_json(
-                    {
-                        "type": "response.done",
-                        "session_id": session.session_id,
-                        "response_id": response_id,
-                        "epoch": epoch,
-                        "committed": committed_message is not None,
-                        "playback": session.playback.as_dict(),
-                    }
+                    self._attach_chat_stage_metrics(
+                        {
+                            "type": "response.done",
+                            "session_id": session.session_id,
+                            "response_id": response_id,
+                            "epoch": epoch,
+                            "committed": committed_message is not None,
+                            "playback": session.playback.as_dict(),
+                        },
+                        session,
+                        stage_metrics=final_stage_metrics,
+                    )
                 )
         except asyncio.CancelledError:
             raise
@@ -177,6 +182,11 @@ class ChatFallbackProjectorMixin:
         response_id: str,
         send_json,
     ) -> None:
+        metrics = payload.get("metrics")
+        stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, dict) else None
+        if isinstance(stage_metrics, dict):
+            session.accumulate_response_stage_metrics(stage_metrics)
+
         modality = payload.get("modality")
         if modality not in {None, "text", "audio"}:
             await send_json(
@@ -218,25 +228,31 @@ class ChatFallbackProjectorMixin:
                 if modality == "audio":
                     session.mark_audio_sent()
                     await send_json(
-                        {
-                            "type": "response.output_audio.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "audio": content,
-                            "format": session.response_config.response_format,
-                        }
+                        self._attach_chat_stage_metrics(
+                            {
+                                "type": "response.output_audio.delta",
+                                "session_id": session.session_id,
+                                "response_id": response_id,
+                                "epoch": epoch,
+                                "audio": content,
+                                "format": session.response_config.response_format,
+                            },
+                            session,
+                        )
                     )
                 else:
                     session.append_assistant_text(content)
                     await send_json(
-                        {
-                            "type": "response.text.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "delta": content,
-                        }
+                        self._attach_chat_stage_metrics(
+                            {
+                                "type": "response.text.delta",
+                                "session_id": session.session_id,
+                                "response_id": response_id,
+                                "epoch": epoch,
+                                "delta": content,
+                            },
+                            session,
+                        )
                     )
 
             finish_reason = choice.get("finish_reason")
@@ -251,3 +267,16 @@ class ChatFallbackProjectorMixin:
                         "modality": modality,
                     }
                 )
+
+    @staticmethod
+    def _attach_chat_stage_metrics(
+        payload: dict[str, object],
+        session: DuplexSession,
+        *,
+        stage_metrics: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        if stage_metrics is None:
+            stage_metrics = session.accumulate_response_stage_metrics(None)
+        if stage_metrics:
+            payload["vllm_omni"] = {"stage_metrics": stage_metrics}
+        return payload
