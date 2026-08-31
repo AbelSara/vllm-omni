@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -111,6 +111,35 @@ def _tiny_od_config(**overrides):
         tf_model_config=TransformerConfig.from_dict(_tiny_tf_model_config(**overrides)),
         dtype=torch.float32,
     )
+
+
+@pytest.mark.parametrize("seq_lengths", [[16], [16, 16]])
+def test_attention_mask_is_skipped_for_dense_batch(seq_lengths):
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _make_attention_mask,
+    )
+
+    hidden_states = torch.empty(len(seq_lengths), 16, HIDDEN_SIZE)
+
+    assert _make_attention_mask(hidden_states, seq_lengths) is None
+
+
+def test_attention_mask_preserves_variable_length_padding():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _make_attention_mask,
+    )
+
+    hidden_states = torch.empty(2, 16, HIDDEN_SIZE)
+
+    attention_mask = _make_attention_mask(hidden_states, [16, 12])
+
+    expected = torch.tensor(
+        [
+            [True] * 16,
+            [True] * 12 + [False] * 4,
+        ]
+    )
+    torch.testing.assert_close(attention_mask, expected)
 
 
 def test_boogu_image_transformer_import():

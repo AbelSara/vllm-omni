@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Native vLLM-Omni port of the Boogu-Image transformer.
 #
@@ -36,6 +36,29 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+def _make_attention_mask(
+    hidden_states: torch.Tensor,
+    seq_lengths: list[int],
+) -> torch.Tensor | None:
+    """Build a padding mask only when the batch contains padding.
+
+    Passing an all-true CUDA mask makes attention backends inspect a device
+    scalar to select the dense path, which introduces a host-device sync.
+    """
+    max_seq_len = max(seq_lengths)
+    if all(seq_len == max_seq_len for seq_len in seq_lengths):
+        return None
+
+    attention_mask = hidden_states.new_zeros(
+        len(seq_lengths),
+        max_seq_len,
+        dtype=torch.bool,
+    )
+    for i, seq_len in enumerate(seq_lengths):
+        attention_mask[i, :seq_len] = True
+    return attention_mask
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -1273,17 +1296,11 @@ class BooguImageTransformer2DModel(nn.Module):
         img_hidden_states = combined_img_hidden_states
 
         # Joint mask for [instruct + image].
-        max_seq_len = max(seq_lengths)
-        joint_attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
-        for i, seq_len in enumerate(seq_lengths):
-            joint_attention_mask[i, :seq_len] = True
+        joint_attention_mask = _make_attention_mask(hidden_states, seq_lengths)
 
         # Dual-stream (double-stream) stage.
         if self.num_double_stream_layers > 0:
-            max_img_len = max(combined_img_seq_lengths)
-            img_attention_mask = hidden_states.new_zeros(batch_size, max_img_len, dtype=torch.bool)
-            for i, img_seq_len in enumerate(combined_img_seq_lengths):
-                img_attention_mask[i, :img_seq_len] = True
+            img_attention_mask = _make_attention_mask(hidden_states, combined_img_seq_lengths)
 
             for layer in self.double_stream_layers:
                 img_hidden_states, instruct_hidden_states = layer(
