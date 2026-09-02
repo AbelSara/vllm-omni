@@ -278,7 +278,7 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 
 ### Attention Backends
 
-On datacenter Blackwell GPUs, MiniMax H3 defaults to dense BF16
+On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,
 use:
 
@@ -298,17 +298,33 @@ FA4 remains available by explicitly selecting the `FLASH_ATTN` backend:
 --diffusion-attention-backend FLASH_ATTN
 ```
 
-On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
-`Using CuTe FlashAttention-4 on Blackwell` before recording FA4 measurements.
+With the optional `[fa4]` dependency installed, `FLASH_ATTN` prefers FA4 on
+Blackwell. Confirm the server log contains `Using CuTe FlashAttention-4 on
+Blackwell` before recording FA4 measurements.
 
-`TRTLLM_ATTN` additionally supports two **lossy** optimizations for the long main
-DiT attention sequence: SAGE attention quantization and Skip-Softmax Sparse
-Attention. SAGE quantizes Q/K to the configured dtype and V to FP8. This example uses
-`fp8_e4m3` for Q/K; B200 also supports `int8` Q/K. The TRTLLM SAGE path fixes V
-to FP8, so vLLM-Omni only exposes the Q/K dtype. The token refiner is a short
-attention path, so the `per_role` override leaves SAGE and Skip-Softmax disabled
-for it. The example enables the calibration-free Skip-Softmax path with
-`threshold=0.05`, after the normalized timestep reaches `0.97`:
+`TRTLLM_ATTN` additionally offers two **lossy** optimizations for the long main
+DiT attention sequence: SAGE attention quantization and Skip-Softmax sparse
+attention. Both work under the pure Ulysses parallelism of the profile above
+(`--usp 4 --ring 1`). The example below enables both:
+
+- SAGE with `fp8_e4m3` Q/K; P and V are always FP8 in this kernel. B200
+  additionally supports `int8` Q/K, which preserves accuracy better than FP8.
+- Skip-Softmax with a direct `threshold=0.05` (the calibrated
+  `target_sparsity` control needs ModelOpt metadata that the official H3
+  checkpoint does not include). Together with the cutoff below this is a
+  **conservative** setting: a low threshold skips only clearly negligible tiles,
+  and a cutoff close to `1.0` leaves a substantial dense prefix. Raise
+  `threshold` or lower `disabled_until_timestep` for more speedup once quality
+  is verified.
+- `disabled_until_timestep=0.97` keeps the early high-noise steps dense. The
+  gate compares against the video sigma, which H3's default flow shift of 12
+  keeps high for much of the run: at 50 steps, `0.99`, `0.97`, and `0.95`
+  leave the first 6, 14, and 19 of 49 denoiser forwards dense. See the
+  [Skip-Softmax design](https://github.com/vllm-project/vllm-omni/blob/main/docs/design/feature/skip_softmax.md#timestep-gating)
+  for how the cutoff maps to steps.
+- A `per_role` entry that keeps the token refiner, a short attention path,
+  dense. A per-role spec does not inherit `quant` or `skip_softmax` from
+  `default`.
 
 ```bash
 --diffusion-attention-config '{
@@ -332,10 +348,13 @@ for it. The example enables the calibration-free Skip-Softmax path with
 }'
 ```
 
-For configuration details, see
-[TRTLLM_ATTN Backend and Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-backend-and-skip-softmax)
+Both optimizations trade fidelity for speed and their effects compound.
+Compare against dense output on the same prompt and seed before adopting them.
+For the full key reference, see
+[Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#skip-softmax)
 and
-[TRTLLM_ATTN SAGE Quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-sage-quantization).
+[SAGE quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#sage-quantization)
+in the TRTLLM attention guide.
 
 ### Text encoder tensor parallelism
 
