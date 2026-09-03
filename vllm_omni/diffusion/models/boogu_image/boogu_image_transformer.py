@@ -41,6 +41,7 @@ logger = init_logger(__name__)
 RotaryEmbedding = tuple[torch.Tensor, torch.Tensor]
 RotaryFrequencyTables = list[RotaryEmbedding]
 
+
 def _make_attention_mask(
     hidden_states: torch.Tensor,
     seq_lengths: list[int],
@@ -62,6 +63,7 @@ def _make_attention_mask(
     for i, seq_len in enumerate(seq_lengths):
         attention_mask[i, :seq_len] = True
     return attention_mask
+
 
 def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tensor:
     """Apply rotary embeddings with real-valued cosine and sine tensors.
