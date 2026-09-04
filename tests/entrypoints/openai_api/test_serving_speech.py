@@ -1711,16 +1711,16 @@ class TestTTSMethods:
         assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
         assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
 
-    # ── encode_reference_codes: speaker cache invalidation ──
+    # ── MossReferenceEncoder: speaker cache invalidation ──
 
     @pytest.mark.asyncio
-    async def test_encode_reference_codes_reencodes_on_key_change(self):
+    async def test_moss_ref_encoder_reencodes_on_key_change(self):
         """Changing the resolve_cache_key must trigger a fresh encode, not serve
         the stale cached tensor.  This is the user-visible fix for delay-family
         voice clones that were reproducing the old speaker."""
         from unittest.mock import MagicMock
 
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
         from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
         speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
@@ -1745,38 +1745,42 @@ class TestTTSMethods:
         async def mock_resolve(ref_str):
             return ([0.1, 0.2, 0.3], 24000, next(resolve_keys))
 
-        # First call: cold miss, encodes and stores
-        result1 = await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
+        encoder = MossReferenceEncoder(
+            processor,
             variant="tts",
             n_vq=32,
             sr_target=24000,
+            speaker_cache=speaker_cache,
         )
-        assert call_count == 1
-        assert torch.equal(result1, codes_v1)
+        try:
+            # First call: cold miss, encodes and stores
+            result1, key1 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+            )
+            assert call_count == 1
+            assert torch.equal(result1, codes_v1)
+            assert key1 == "key_aaa"
 
-        # Second call: different resolve key → must re-encode, not serve cached
-        result2 = await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
-            variant="tts",
-            n_vq=32,
-            sr_target=24000,
-        )
-        assert call_count == 2, "Different resolve key should trigger re-encode"
-        assert torch.equal(result2, codes_v2)
+            # Second call: different resolve key → must re-encode, not serve cached
+            result2, key2 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+            )
+            assert call_count == 2, "Different resolve key should trigger re-encode"
+            assert torch.equal(result2, codes_v2)
+            assert key2 == "key_bbb"
+        finally:
+            await encoder.aclose()
 
     @pytest.mark.asyncio
-    async def test_encode_reference_codes_named_voice_skips_resolve_on_hit(self):
+    async def test_moss_ref_encoder_named_voice_skips_resolve_on_hit(self):
         """Named-voice cache hit must NOT call resolve_ref_audio."""
         from unittest.mock import MagicMock
 
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
         from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
         speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
@@ -1791,33 +1795,37 @@ class TestTTSMethods:
             resolve_called += 1
             return ([0.1], 24000, "some_key")
 
-        # First call: cold miss, resolves + encodes
-        await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
+        encoder = MossReferenceEncoder(
+            processor,
             variant="tts",
             n_vq=32,
             sr_target=24000,
-            voice_name="alice",
-            voice_created_at=100,
+            speaker_cache=speaker_cache,
         )
-        assert resolve_called == 1
+        try:
+            # First call: cold miss, resolves + encodes
+            _, key1 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+                voice_name="alice",
+                voice_created_at=100,
+            )
+            assert resolve_called == 1
+            assert key1 == "some_key"
 
-        # Second call: warm hit, must NOT resolve
-        await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
-            variant="tts",
-            n_vq=32,
-            sr_target=24000,
-            voice_name="alice",
-            voice_created_at=100,
-        )
-        assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+            # Second call: warm hit, must NOT resolve
+            _, key2 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+                voice_name="alice",
+                voice_created_at=100,
+            )
+            assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+            assert key2 is None  # no resolve happened; salted by voice_created_at
+        finally:
+            await encoder.aclose()
 
     @pytest.mark.asyncio
     async def test_ttsd_second_reference_does_not_use_named_voice(self, speech_server, mocker):
@@ -1835,14 +1843,12 @@ class TestTTSMethods:
 
         seen: list[tuple[str, str | None]] = []
 
-        async def fake_encode(ref_str, **kwargs):
-            seen.append((ref_str, kwargs.get("voice_name")))
-            return torch.zeros(3, dtype=torch.int64)
+        class _FakeEncoder:
+            async def encode(self, ref_str, **kwargs):
+                seen.append((ref_str, kwargs.get("voice_name")))
+                return torch.zeros(3, dtype=torch.int64), f"rk:{ref_str}"
 
-        mocker.patch(
-            "vllm_omni.model_executor.models.moss_tts.reference_encoder.encode_reference_codes",
-            fake_encode,
-        )
+        mocker.patch.object(speech_server, "_get_moss_ref_encoder", return_value=_FakeEncoder())
 
         req = OpenAICreateSpeechRequest(
             input="hello",
@@ -1850,11 +1856,14 @@ class TestTTSMethods:
             ref_audio="data:audio/wav;base64,aaa",
             ref_audio_2="data:audio/wav;base64,bbb",
         )
-        await speech_server._build_moss_tts_params(req, has_inline_ref_audio=False)
-        assert seen == [
+        params = await speech_server._build_moss_tts_params(req, has_inline_ref_audio=False)
+        assert sorted(seen) == [
             ("data:audio/wav;base64,aaa", "alice"),
             ("data:audio/wav;base64,bbb", None),
         ]
+        # Per-slot salt keys survive the concurrent (gather) encode order.
+        assert params["ref_audio_cache_key"] == "rk:data:audio/wav;base64,aaa"
+        assert params["ref_audio_2_cache_key"] == "rk:data:audio/wav;base64,bbb"
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
