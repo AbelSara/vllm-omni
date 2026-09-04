@@ -600,7 +600,7 @@ def concat_audio(audio_val) -> np.ndarray:
 def preprocess_text(text):
     import opencc
 
-    word_to_num = {
+    word_normalizations = {
         "zero": "0",
         "one": "1",
         "two": "2",
@@ -612,10 +612,11 @@ def preprocess_text(text):
         "eight": "8",
         "nine": "9",
         "ten": "10",
+        "kilohertz": "khz",
     }
-    for word, num in word_to_num.items():
+    for word, replacement in word_normalizations.items():
         pattern = r"\b" + re.escape(word) + r"\b"
-        text = re.sub(pattern, num, text, flags=re.IGNORECASE)
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)

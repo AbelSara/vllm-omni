@@ -15,6 +15,14 @@ from tests.helpers import media
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_preprocess_text_normalizes_spoken_kilohertz():
+    expected = "This response should be encoded as eight kilohertz audio."
+    transcript = "This response should be encoded as 8 kHz audio."
+
+    assert media.preprocess_text(expected) == media.preprocess_text(transcript)
+    assert media.cosine_similarity_text(expected, transcript) == pytest.approx(1.0)
+
+
 def _stub_transcribe(monkeypatch) -> dict:
     """Capture the kwargs the helper hands to whisper, with no model and no device."""
     captured: dict = {}
