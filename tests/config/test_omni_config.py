@@ -1269,6 +1269,10 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "    fa_deterministic: true",
                 "    diffusion_kv_mode: paged_scheduler",
                 "    diffusion_kv_max_rows_per_request: 2",
+                "    kv_transfer_config:",
+                "      kv_connector: MooncakeConnector",
+                "      kv_role: kv_consumer",
+                "      engine_id: dit-engine-1",
             ]
         )
     )
@@ -1283,6 +1287,14 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert stage.diffusion_config.diffusion_kv_max_rows_per_request == 2
+    assert stage.diffusion_config.kv_transfer_config.engine_id == "dit-engine-1"
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+    assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
 
 def test_from_pipeline_config_forwards_fastvideo_vsa_topk(tmp_path, monkeypatch):

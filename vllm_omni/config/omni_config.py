@@ -18,10 +18,11 @@ from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
@@ -775,10 +776,18 @@ class _DiffusionConfigProjection:
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
+    kv_transfer_config: KVTransferConfig | None = None
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+    @field_validator("kv_transfer_config", mode="before")
+    @classmethod
+    def _normalize_kv_transfer_config(cls, value: Any) -> Any:
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
+
+        return parse_kv_transfer_config(value)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:

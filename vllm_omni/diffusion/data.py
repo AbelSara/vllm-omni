@@ -34,7 +34,7 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
-    from vllm.config import ProfilerConfig
+    from vllm.config import KVTransferConfig, ProfilerConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
@@ -935,6 +935,9 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+    # Native vLLM KV connector configuration. PR0 only assembles the connector;
+    # the native page data path is owned by the follow-up landing PR.
+    kv_transfer_config: "KVTransferConfig | None" = None
     additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
@@ -1105,6 +1108,19 @@ class OmniDiffusionConfig:
                 "paged_scheduler Diffusion KV does not support imported AR KV; "
                 "disable need_recv_cache until connector-aware import is implemented"
             )
+
+        if self.kv_transfer_config is not None:
+            from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
+
+            if any(self.omni_kv_config.get(name, False) for name in ("need_send_cache", "need_recv_cache")):
+                raise ValueError(
+                    "native kv_transfer_config cannot be combined with legacy omni_kv_config transfer; "
+                    "configure exactly one KV transfer path"
+                )
+            if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+                raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
+            self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
         if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
