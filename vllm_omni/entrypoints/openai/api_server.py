@@ -3348,7 +3348,7 @@ async def _parse_video_form(
     width: int | None = Form(default=None),
     height: int | None = Form(default=None),
     num_frames: int | None = Form(default=None),
-    fps: int | None = Form(default=None),
+    fps: float | None = Form(default=None, ge=1, allow_inf_nan=False),
     aspect_ratio: str | None = Form(default=None),
     short_edge: int | None = Form(default=None, ge=1),
     num_outputs_per_prompt: int = Form(default=1, ge=1, le=10),
