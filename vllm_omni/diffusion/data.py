@@ -804,7 +804,12 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
-    # CPU offload parameters
+    # CPU offload parameters. Keep the public mapping raw so stage configs can
+    # serialize it across processes; __post_init__ validates it once and caches
+    # the internal typed resolution used at runtime.
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases. Some model-specific legacy stage lifecycles are
+    # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
@@ -1056,6 +1061,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.offloader.config import (
+            OffloadStrategy,
+            materialize_legacy_offload_flags,
+        )
+
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1128,6 +1138,9 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        # Resolve offload only after DP/SP normalization so cached policy
+        # validation observes the actual execution topology.
+        offload_strategy = materialize_legacy_offload_flags(self)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1136,10 +1149,14 @@ class OmniDiffusionConfig:
                 incompatible_features.append("HSDP")
             if self.parallel_config.sequence_parallel_size > 1:
                 incompatible_features.append("sequence parallelism")
-            if self.enable_cpu_offload:
-                incompatible_features.append("CPU offload")
-            if self.enable_layerwise_offload:
-                incompatible_features.append("layerwise offload")
+            if offload_strategy is not OffloadStrategy.NONE:
+                incompatible_features.append(
+                    {
+                        OffloadStrategy.MODEL_LEVEL: "CPU offload",
+                        OffloadStrategy.LAYER_WISE: "layerwise offload",
+                        OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                    }[offload_strategy]
+                )
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
