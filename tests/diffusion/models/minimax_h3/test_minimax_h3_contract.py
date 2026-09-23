@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import numpy as np
 import pytest
@@ -1386,12 +1386,14 @@ def test_text_encoder_rejects_serialized_fp8():
 
 def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     import vllm_omni.diffusion.models.minimax_h3.encoder as encoder_module
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     method = UnquantizedLinearMethod()
-    quant_config = Mock()
+    quant_config = create_autospec(QuantizationConfig, instance=True)
+    quant_config.online_quantization_config = None
     quant_config.get_quant_method.return_value = method
     prefix = "text_encoder.text_model.layers.0.mlp.gate_up_proj"
 
