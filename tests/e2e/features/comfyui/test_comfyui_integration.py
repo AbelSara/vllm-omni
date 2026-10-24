@@ -93,6 +93,7 @@ class SamplingKind(str, Enum):
     VIDEO_FL2VA = "video_fl2va"
     VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
+    VIDEO_REF2VA_LOCK_SOURCE = "video_ref2va_lock_source"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
     VIDEO_REF2VA_MIXED = "video_ref2va_mixed"
 
@@ -492,7 +493,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             _assert_model_param_values(received, {"task": "t2va", "aspect_ratio": "1:1"})
             assert "flow_shift" not in received.extra_args
             assert "audio_flow_shift" not in received.extra_args
-        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
+        elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, SamplingKind.VIDEO_REF2VA_LOCK_SOURCE):
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
             multi_modal_data = prompt.get("multi_modal_data")
@@ -515,6 +516,10 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "flow_shift": 12.0,
                     "task": "ref2va",
                     "audio_flow_shift": 3.0,
+                    # The music-video workflow drives each shot with its slice of the track.
+                    "audio_mode": (
+                        "lock_source" if sampling_case.kind is SamplingKind.VIDEO_REF2VA_LOCK_SOURCE else None
+                    ),
                 },
             )
         elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, SamplingKind.VIDEO_REF2VA_MIXED):
@@ -1289,6 +1294,17 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_LOCK_SOURCE, sampling_params=None),
+            "image_audio_lock_source",
+            id="ref2va-image-audio-lock-source",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
             "multi_video",
             id="ref2va-multi-video",
@@ -1316,7 +1332,8 @@ async def test_video_generation_node_minimax_h3_ref2va(
     node = VLLMOmniGenerateVideo()
     refs_node = VLLMOmniVideoReferences()
 
-    if ref_mode == "image_audio":
+    model_params = H3_MODEL_PARAMS
+    if ref_mode in ("image_audio", "image_audio_lock_source"):
         (references,) = refs_node.get_references(
             image_1=torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32),
             audio_1={"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},
@@ -1325,6 +1342,8 @@ async def test_video_generation_node_minimax_h3_ref2va(
             "A white cat with black mustache and eyebrow markings sits on a beige couch, "
             "lip-syncing precisely to the complete reference audio."
         )
+        if ref_mode == "image_audio_lock_source":
+            model_params = MiniMaxH3ModelSpecificParams({**H3_MODEL_PARAMS, "audio_mode": "lock_source"})
     elif ref_mode == "multi_video":
         (references,) = refs_node.get_references(
             video_1=VideoInput(b"subject-video"),  # type: ignore[reportAbstractUsage]
@@ -1357,7 +1376,7 @@ async def test_video_generation_node_minimax_h3_ref2va(
         fps=VIDEO_FPS,
         duration=VIDEO_DURATION,
         references=references,
-        model_params=H3_MODEL_PARAMS,
+        model_params=model_params,
     )
 
     assert isinstance(result, tuple)

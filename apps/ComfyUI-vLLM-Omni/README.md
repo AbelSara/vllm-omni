@@ -180,6 +180,9 @@ drop the server's audio while decoding the response.
    Keep the references connected to **Generate Video** and leave `frame` disconnected.
 4. Match prompt tags such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>` to the
    connected references, counting each media type separately and skipping empty slots.
+   To drive the clip with a soundtrack instead, connect exactly one audio and set
+   **MiniMax-H3 Video Params → audio_mode** to `lock_source`; that audio is not
+   counted as an `<Audio N>` reference.
 5. Run the workflow. **Save Video** writes an MP4 under `output/video/` and preserves
    the generated audio when the audio-output prerequisite is installed.
 
@@ -229,6 +232,14 @@ optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 [workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
 settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
 the downloaded Turbo artifact on your server before enabling Turbo.
+
+#### H3 all-in-one (H3-06)
+
+The **vLLM-Omni MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and mixed-reference Ref2VA in one graph. The server URL, served model name, duration, sampling, and flow shifts are set once and shared by all modes; enable the group for the mode you want to run. It does not include a prompt LLM. See [workflow setup](docs/h3-06-all-in-one.md).
+
+#### H3 music video from a supplied track (H3-03)
+
+The **vLLM-Omni MiniMax-H3 Music Video** template cuts a supplied music track into 124-frame slices, generates one Ref2VA shot per slice with a shared character/style image, and joins the shots with the original track as the soundtrack. Each shot sets **MiniMax-H3 Video Params → audio_mode** to `lock_source`, so its slice drives generation instead of acting as a short reference. Requires ComfyUI v0.36.0+ for Concatenate Video. See [workflow setup](docs/h3-03-music-video.md).
 
 #### H3 video upscale (WF-07)
 
