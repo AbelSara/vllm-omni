@@ -32,9 +32,9 @@ if TYPE_CHECKING:
     from torch.multiprocessing.reductions import StorageWeakRef
 
 
-# Reviewed against both tagged reductions.py, StorageSharing.cpp and allocator
-# snapshots. Other releases are deliberately not inferred from this interval.
-_CODEC_VERSIONS = {(2, 10): "torch-2.10-native-v1", (2, 13): "torch-2.13-native-v1"}
+# Pinned to PyTorch 2.13.0's reductions.py, StorageSharing.cpp and allocator
+# snapshots. Other releases require an explicit ABI review.
+_CODEC_VERSION = "torch-2.13-native-v1"
 
 
 def _check_torch_version() -> str:
@@ -42,10 +42,10 @@ def _check_torch_version() -> str:
     from packaging.version import Version
 
     version = Version(torch.__version__)
-    codec = _CODEC_VERSIONS.get((version.major, version.minor))
-    if codec is None or version.is_prerelease or version.is_devrelease:
-        raise UnsupportedError("CUDA weight sharing supports the PyTorch 2.10 and 2.13 release ABIs only")
-    return codec
+    # Local build tags such as +cu130 do not change the release ABI.
+    if version.public != "2.13.0":
+        raise UnsupportedError("CUDA weight sharing supports the PyTorch 2.13.0 release ABI only")
+    return _CODEC_VERSION
 
 
 def _byte_carrier(tensor: torch.Tensor) -> torch.Tensor:
@@ -71,16 +71,14 @@ def _describe_bindings(bindings: Mapping[str, object], spec: WeightSpec) -> Prep
     storages: list[StorageSpec] = []
     views: list[TensorViewSpec] = []
     for entry in spec.tensors:
-        tensor = bindings[entry.name]
-        if type(tensor) not in (torch.Tensor, torch.nn.Parameter):
+        value = bindings[entry.name]
+        if type(value) not in (torch.Tensor, torch.nn.Parameter):
             raise UnsupportedError(f"unsupported tensor subclass: {entry.name}")
-        tensor = cast("torch.Tensor", tensor)
+        tensor = cast("torch.Tensor", value)
         if tensor.layout != torch.strided or tensor.is_nested or tensor.device.type == "meta":
             raise UnsupportedError(f"only materialized dense strided tensors are supported: {entry.name}")
-        if tensor.is_conj() or tensor.is_neg() or tensor.is_quantized or any(name is not None for name in tensor.names):
-            raise UnsupportedError(
-                f"lazy conjugate/negative, quantized and named tensors are unsupported: {entry.name}"
-            )
+        if tensor.is_conj() or tensor.is_neg() or tensor.is_quantized:
+            raise UnsupportedError(f"lazy conjugate/negative and quantized tensors are unsupported: {entry.name}")
         storage = tensor.untyped_storage()
         storage_key = storage._cdata
         storage_id = storage_ids.get(storage_key)
@@ -311,7 +309,7 @@ class TorchCudaIpcCodec:
         _validate_descriptor(descriptor)
         if type(device_index) is not int or device_index < 0:
             raise CompatibilityError("consumer device index must be a nonnegative integer")
-        # Supported PyTorch releases store an integer ordinal, not torch.device.
+        # PyTorch 2.13.0 stores an integer ordinal, not torch.device.
         # Never accept a remote callable or class: those values are fixed here.
         return rebuild_cuda_tensor(
             torch.Tensor,
@@ -343,9 +341,10 @@ class TorchCudaIpcCodec:
         if set(carriers) != {storage.storage_id for storage in manifest.storages}:
             raise CompatibilityError("mapped storage identities differ from the manifest")
         for storage in manifest.storages:
-            carrier = carriers[storage.storage_id]
-            if type(carrier) is not torch.Tensor:
+            value = carriers[storage.storage_id]
+            if type(value) is not torch.Tensor:
                 raise CompatibilityError("a mapped byte carrier must be a plain tensor")
+            carrier = cast("torch.Tensor", value)
             if carrier.untyped_storage().nbytes() != storage.nbytes:
                 raise CompatibilityError("mapped storage size differs from the manifest")
         result: dict[str, object] = {}

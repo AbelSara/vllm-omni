@@ -120,8 +120,8 @@ def test_distinct_storages_are_not_merged(api, codec_module):
     assert len(prepared.carriers) == 2
 
 
-@pytest.mark.parametrize("kind", ["meta", "conjugate", "negative", "sparse", "subclass", "named"])
-def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, kind):
+@pytest.mark.parametrize("kind", ["meta", "conjugate", "negative", "sparse", "subclass", "quantized"])
+def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, mocker, kind):
     if kind == "meta":
         tensor = torch.empty(4, device="meta")
     elif kind == "conjugate":
@@ -130,8 +130,8 @@ def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, kind):
         tensor = torch._neg_view(torch.ones(4))
     elif kind == "sparse":
         tensor = torch.ones(4).to_sparse()
-    elif kind == "named":
-        tensor = torch.ones(4, names=("feature",))
+    elif kind == "quantized":
+        tensor = torch.quantize_per_tensor(torch.ones(4), scale=0.1, zero_point=0, dtype=torch.qint8)
     else:
 
         class TensorSubclass(torch.Tensor):
@@ -139,8 +139,10 @@ def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, kind):
 
         tensor = torch.ones(4).as_subclass(TensorSubclass)
     spec = api.WeightSpec("m", "r", "l", (api.TensorSpec("weight", str(tensor.dtype).removeprefix("torch."), (4,)),))
+    carrier = mocker.spy(codec_module, "_byte_carrier")
     with pytest.raises(api.UnsupportedError):
         codec_module._describe_bindings({"weight": tensor}, spec)
+    carrier.assert_not_called()
 
 
 def test_cpp_storage_lease_survives_python_carrier_and_external_view(codec_module):
@@ -184,7 +186,7 @@ def test_integer_device_reduction_schema(api, codec_module):
 
 
 def test_import_remaps_to_local_device_and_uses_fixed_rebuild(api, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.10-native-v1")
+    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
     codec = codec_module.TorchCudaIpcCodec()
     assert codec.import_storage(_descriptor(api, codec_module), 0) is rebuild.return_value
@@ -198,7 +200,7 @@ def test_import_remaps_to_local_device_and_uses_fixed_rebuild(api, codec_module,
 
 
 def test_rebuild_error_is_propagated_without_counter_cancellation(api, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.10-native-v1")
+    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     mocker.patch.object(
         torch.multiprocessing.reductions, "rebuild_cuda_tensor", side_effect=RuntimeError("possibly consumed")
     )
@@ -209,23 +211,38 @@ def test_rebuild_error_is_propagated_without_counter_cancellation(api, codec_mod
 
 
 def test_cancel_uses_only_the_supplied_unconsumed_counter(api, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.10-native-v1")
+    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     release = mocker.patch.object(torch.storage.TypedStorage, "_release_ipc_counter")
     codec_module.TorchCudaIpcCodec().cancel_unconsumed(_descriptor(api, codec_module), 0)
     release.assert_called_once_with(b"counter", 7, device=0)
 
 
-@pytest.mark.parametrize("version", ["2.9.1", "2.11.0", "2.12.0", "2.14.0", "2.10.0.dev1", "2.13.0rc1"])
+@pytest.mark.parametrize(
+    "version",
+    [
+        "2.9.1",
+        "2.10.0+cpu",
+        "2.10.1+cu130",
+        "2.11.0",
+        "2.12.0",
+        "2.14.0",
+        "2.10.0.dev1",
+        "2.13.0rc1",
+        "2.13.0.dev1",
+        "2.13.0.post1",
+        "2.13.1+cu130",
+    ],
+)
 def test_unknown_abi_rejected(api, codec_module, monkeypatch, version):
     monkeypatch.setattr(torch, "__version__", version)
-    with pytest.raises(api.UnsupportedError, match="2.10"):
+    with pytest.raises(api.UnsupportedError, match=r"2\.13\.0"):
         codec_module._check_torch_version()
 
 
-@pytest.mark.parametrize("version", ["2.10.0+cpu", "2.10.1+cu130", "2.13.0+cu130"])
+@pytest.mark.parametrize("version", ["2.13.0", "2.13.0+cpu", "2.13.0+cu130"])
 def test_supported_release_abi(codec_module, monkeypatch, version):
     monkeypatch.setattr(torch, "__version__", version)
-    codec_module._check_torch_version()
+    assert codec_module._check_torch_version() == "torch-2.13-native-v1"
 
 
 def test_consumer_checks_runtime_once_and_sync_does_not_rescan(api, codec_module, cuda_runtime):
@@ -251,12 +268,14 @@ def test_consumer_runtime_rejects_unsafe_environment(api, codec_module, cuda_run
         codec_module.TorchCudaIpcCodec().validate_runtime(make_context(api))
 
 
-def test_cross_minor_codec_is_rejected_before_rebuild(api, codec_module, monkeypatch):
-    monkeypatch.setattr(torch, "__version__", "2.10.0")
-    descriptor = _descriptor(api, codec_module)
+@pytest.mark.parametrize("codec", ["torch-2.10-native-v1", "torch-2.14-native-v1", "torch-2.13-native-v2"])
+def test_incompatible_codec_is_rejected_before_rebuild(api, codec_module, monkeypatch, mocker, codec):
     monkeypatch.setattr(torch, "__version__", "2.13.0")
+    descriptor = msgspec.structs.replace(_descriptor(api, codec_module), codec=codec)
+    rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
     with pytest.raises(api.UnsupportedError, match="codec"):
-        codec_module._validate_descriptor(descriptor)
+        codec_module.TorchCudaIpcCodec().import_storage(descriptor, 0)
+    rebuild.assert_not_called()
 
 
 @pytest.mark.parametrize(
