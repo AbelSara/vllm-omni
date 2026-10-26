@@ -46,6 +46,9 @@ class Limits:
 
 
 _HEADER = struct.Struct("!I")
+# Each SCM_RIGHTS frame is one marker byte carrying one descriptor's fds.
+_FD_FRAME = b"F"
+_MAX_FRAME_FDS = 16
 
 
 class FramedConnection:
@@ -121,6 +124,42 @@ class FramedConnection:
             return message
         except (OSError, msgspec.DecodeError) as error:
             raise ChannelError("Could not receive a valid metadata message") from error
+
+    def send_fds(self, groups: tuple[tuple[int, ...], ...]) -> None:
+        """Send each group of file descriptors as its own SCM_RIGHTS frame.
+
+        One frame per group keeps every receive bounded to one descriptor's
+        fds; Unix stream sockets never merge ancillary data across frames.
+        """
+        deadline = time.monotonic() + self.limits.timeout
+        try:
+            for fds in groups:
+                if not 0 < len(fds) <= _MAX_FRAME_FDS:
+                    raise ChannelError("Invalid file descriptor frame")
+                self._set_remaining(deadline)
+                if socket.send_fds(self._socket, [_FD_FRAME], list(fds)) != len(_FD_FRAME):
+                    raise ChannelError("Could not send a file descriptor frame")
+        except OSError as error:
+            raise ChannelError("Could not send file descriptors") from error
+
+    def recv_fds(self, count: int) -> tuple[int, ...]:
+        """Receive one frame of exactly ``count`` fds; the caller owns them."""
+        if not 0 < count <= _MAX_FRAME_FDS:
+            raise ChannelError("Invalid file descriptor frame")
+        deadline = time.monotonic() + self.limits.timeout
+        fds: list[int] = []
+        try:
+            self._set_remaining(deadline)
+            data, fds, flags, _address = socket.recv_fds(self._socket, len(_FD_FRAME), count)
+            if data != _FD_FRAME or len(fds) != count or flags & socket.MSG_CTRUNC:
+                raise ChannelError("Unexpected file descriptor frame")
+            return tuple(fds)
+        except BaseException as error:
+            for fd in fds:
+                os.close(fd)
+            if isinstance(error, OSError):
+                raise ChannelError("Could not receive file descriptors") from error
+            raise
 
     def close(self) -> None:
         with self._close_lock:

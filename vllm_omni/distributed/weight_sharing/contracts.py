@@ -133,6 +133,9 @@ class StorageExport(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     ref_counter_offset: int
     event_handle: bytes
     event_sync_required: bool
+    # File descriptors sent with SCM_RIGHTS after the bundle, in export order.
+    # Zero for CUDA, whose handles are self-contained bytes.
+    fd_count: int = 0
 
 
 MessageOp = Literal[
@@ -198,6 +201,23 @@ class CudaIpcCodec(Protocol):
     def weak_storage(self, carrier: object) -> StorageLease: ...
 
     def cancel_unconsumed(self, descriptor: StorageExport, device_index: int) -> None: ...
+
+
+class FdPassingCodec(CudaIpcCodec, Protocol):
+    """A codec whose handles reference file descriptors (Level Zero dma-bufs).
+
+    The backend calls these only for descriptors with ``fd_count > 0``.
+    export_fds returns provider-owned fds that the backend sends but never closes.
+    receive_fds transfers ownership of received fds to the codec, which closes
+    them during import_storage. release_consumed runs after the peer released
+    its mapping, the counterpart of cancel_unconsumed for consumed exports.
+    """
+
+    def export_fds(self, descriptor: StorageExport) -> tuple[int, ...]: ...
+
+    def receive_fds(self, descriptor: StorageExport, fds: tuple[int, ...]) -> None: ...
+
+    def release_consumed(self, descriptor: StorageExport, device_index: int) -> None: ...
 
 
 @dataclass(frozen=True)
