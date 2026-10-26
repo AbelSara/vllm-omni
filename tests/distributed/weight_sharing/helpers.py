@@ -47,6 +47,20 @@ def load_weight_sharing() -> ModuleType:
     return module
 
 
+def make_tensor_specs(api, bindings, aliases=None):
+    aliases = aliases or {}
+    return tuple(
+        api.TensorSpec(
+            name,
+            str(tensor.dtype).removeprefix("torch."),
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            aliases.get(name),
+        )
+        for name, tensor in bindings.items()
+    )
+
+
 def make_context(api, endpoint: str = "unused", **identity_changes):
     identity = {
         "group_id": "group",

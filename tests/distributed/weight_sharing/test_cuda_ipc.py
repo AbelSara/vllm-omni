@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from tests.distributed.weight_sharing.cuda_helpers import receive, require_cuda, runtime, spawn_workers
+from tests.distributed.weight_sharing.helpers import make_tensor_specs
 from tests.helpers.mark import hardware_marks
 
 require_cuda()
@@ -43,16 +44,7 @@ def _spec(api):
         "small-test-model",
         "revision",
         "tp1-final",
-        tuple(
-            api.TensorSpec(
-                name,
-                str(tensor.dtype).removeprefix("torch."),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                "first" if name == "alias" else None,
-            )
-            for name, tensor in _bindings("cpu").items()
-        ),
+        make_tensor_specs(api, _bindings("cpu"), {"alias": "first"}),
     )
 
 

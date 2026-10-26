@@ -9,19 +9,14 @@ import msgspec
 import pytest
 import torch
 
-from tests.distributed.weight_sharing.helpers import make_context
+from tests.distributed.weight_sharing.helpers import make_context, make_tensor_specs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def api(weight_sharing):
-    return importlib.import_module(f"{weight_sharing.__name__}.contracts")
-
-
-@pytest.fixture
-def codec_module(api):
-    return importlib.import_module(f"{api.__package__}.torch_cuda_ipc_codec")
+def codec_module(contracts):
+    return importlib.import_module(f"{contracts.__package__}.torch_cuda_ipc_codec")
 
 
 @pytest.fixture
@@ -45,27 +40,14 @@ def cuda_runtime(codec_module, monkeypatch):
     return snapshot, calls
 
 
-def _spec(api, bindings, aliases=None):
-    aliases = aliases or {}
-    return api.WeightSpec(
-        "test-model",
-        "checkpoint-1",
-        "final-layout",
-        tuple(
-            api.TensorSpec(
-                name,
-                str(tensor.dtype).removeprefix("torch."),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                aliases.get(name),
-            )
-            for name, tensor in bindings.items()
-        ),
+def _spec(contracts, bindings, aliases=None):
+    return contracts.WeightSpec(
+        "test-model", "checkpoint-1", "final-layout", make_tensor_specs(contracts, bindings, aliases)
     )
 
 
-def _descriptor(api, codec_module):
-    return api.StorageExport(
+def _descriptor(contracts, codec_module):
+    return contracts.StorageExport(
         "storage-0",
         codec_module._check_torch_version(),
         3,
@@ -79,7 +61,7 @@ def _descriptor(api, codec_module):
     )
 
 
-def test_storage_dedup_alias_mixed_dtype_and_noncontiguous_views_without_copy(api, codec_module):
+def test_storage_dedup_alias_mixed_dtype_and_noncontiguous_views_without_copy(contracts, codec_module):
     base = torch.arange(24, dtype=torch.float32).reshape(4, 6)
     parameter = torch.nn.Parameter(base[:2])
     floats = torch.arange(16, dtype=torch.float32)
@@ -94,7 +76,7 @@ def test_storage_dedup_alias_mixed_dtype_and_noncontiguous_views_without_copy(ap
         "empty_storage": torch.empty(0),
         "overlap": floats.as_strided((3, 4), (0, 1)),
     }
-    spec = _spec(api, bindings, {"alias": "weight"})
+    spec = _spec(contracts, bindings, {"alias": "weight"})
     prepared = codec_module._describe_bindings(bindings, spec)
     assert len(prepared.manifest.storages) == 3
     assert sum(storage.nbytes > 0 for storage in prepared.manifest.storages) == 2
@@ -114,14 +96,14 @@ def test_storage_dedup_alias_mixed_dtype_and_noncontiguous_views_without_copy(ap
         assert restored[name].untyped_storage()._cdata == tensor.untyped_storage()._cdata
 
 
-def test_distinct_storages_are_not_merged(api, codec_module):
+def test_distinct_storages_are_not_merged(contracts, codec_module):
     bindings = {"a": torch.ones(4), "b": torch.ones(4)}
-    prepared = codec_module._describe_bindings(bindings, _spec(api, bindings))
+    prepared = codec_module._describe_bindings(bindings, _spec(contracts, bindings))
     assert len(prepared.carriers) == 2
 
 
 @pytest.mark.parametrize("kind", ["meta", "conjugate", "negative", "sparse", "subclass", "quantized"])
-def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, mocker, kind):
+def test_unsupported_tensor_forms_fail_without_copy(contracts, codec_module, mocker, kind):
     if kind == "meta":
         tensor = torch.empty(4, device="meta")
     elif kind == "conjugate":
@@ -138,9 +120,11 @@ def test_unsupported_tensor_forms_fail_without_copy(api, codec_module, mocker, k
             pass
 
         tensor = torch.ones(4).as_subclass(TensorSubclass)
-    spec = api.WeightSpec("m", "r", "l", (api.TensorSpec("weight", str(tensor.dtype).removeprefix("torch."), (4,)),))
+    spec = contracts.WeightSpec(
+        "m", "r", "l", (contracts.TensorSpec("weight", str(tensor.dtype).removeprefix("torch."), (4,)),)
+    )
     carrier = mocker.spy(codec_module, "_byte_carrier")
-    with pytest.raises(api.UnsupportedError):
+    with pytest.raises(contracts.UnsupportedError):
         codec_module._describe_bindings({"weight": tensor}, spec)
     carrier.assert_not_called()
 
@@ -160,7 +144,7 @@ def test_cpp_storage_lease_survives_python_carrier_and_external_view(codec_modul
     lease.close()
 
 
-def test_integer_device_reduction_schema(api, codec_module):
+def test_integer_device_reduction_schema(contracts, codec_module):
     args = (
         torch.Tensor,
         (64,),
@@ -179,17 +163,17 @@ def test_integer_device_reduction_schema(api, codec_module):
         False,
     )
     descriptor = codec_module._encode_reduction(args, "storage-0", 64)
-    assert descriptor == _descriptor(api, codec_module)
+    assert descriptor == _descriptor(contracts, codec_module)
     incompatible = args[:6] + (torch.device("cuda", 3),) + args[7:]
-    with pytest.raises(api.CompatibilityError, match="device or offset"):
+    with pytest.raises(contracts.CompatibilityError, match="device or offset"):
         codec_module._encode_reduction(incompatible, "storage-0", 64)
 
 
-def test_import_remaps_to_local_device_and_uses_fixed_rebuild(api, codec_module, mocker):
+def test_import_remaps_to_local_device_and_uses_fixed_rebuild(contracts, codec_module, mocker):
     mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
     codec = codec_module.TorchCudaIpcCodec()
-    assert codec.import_storage(_descriptor(api, codec_module), 0) is rebuild.return_value
+    assert codec.import_storage(_descriptor(contracts, codec_module), 0) is rebuild.return_value
     rebuild.assert_called_once()
     args = rebuild.call_args.args
     assert args[0] is torch.Tensor
@@ -199,21 +183,21 @@ def test_import_remaps_to_local_device_and_uses_fixed_rebuild(api, codec_module,
     assert args[12] == 7
 
 
-def test_rebuild_error_is_propagated_without_counter_cancellation(api, codec_module, mocker):
+def test_rebuild_error_is_propagated_without_counter_cancellation(contracts, codec_module, mocker):
     mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     mocker.patch.object(
         torch.multiprocessing.reductions, "rebuild_cuda_tensor", side_effect=RuntimeError("possibly consumed")
     )
     release = mocker.patch.object(torch.storage.TypedStorage, "_release_ipc_counter")
     with pytest.raises(RuntimeError, match="possibly consumed"):
-        codec_module.TorchCudaIpcCodec().import_storage(_descriptor(api, codec_module), 0)
+        codec_module.TorchCudaIpcCodec().import_storage(_descriptor(contracts, codec_module), 0)
     release.assert_not_called()
 
 
-def test_cancel_uses_only_the_supplied_unconsumed_counter(api, codec_module, mocker):
+def test_cancel_uses_only_the_supplied_unconsumed_counter(contracts, codec_module, mocker):
     mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     release = mocker.patch.object(torch.storage.TypedStorage, "_release_ipc_counter")
-    codec_module.TorchCudaIpcCodec().cancel_unconsumed(_descriptor(api, codec_module), 0)
+    codec_module.TorchCudaIpcCodec().cancel_unconsumed(_descriptor(contracts, codec_module), 0)
     release.assert_called_once_with(b"counter", 7, device=0)
 
 
@@ -233,9 +217,9 @@ def test_cancel_uses_only_the_supplied_unconsumed_counter(api, codec_module, moc
         "2.13.1+cu130",
     ],
 )
-def test_unknown_abi_rejected(api, codec_module, monkeypatch, version):
+def test_unknown_abi_rejected(contracts, codec_module, monkeypatch, version):
     monkeypatch.setattr(torch, "__version__", version)
-    with pytest.raises(api.UnsupportedError, match=r"2\.13\.0"):
+    with pytest.raises(contracts.UnsupportedError, match=r"2\.13\.0"):
         codec_module._check_torch_version()
 
 
@@ -245,9 +229,9 @@ def test_supported_release_abi(codec_module, monkeypatch, version):
     assert codec_module._check_torch_version() == "torch-2.13-native-v1"
 
 
-def test_consumer_checks_runtime_once_and_sync_does_not_rescan(api, codec_module, cuda_runtime):
+def test_consumer_checks_runtime_once_and_sync_does_not_rescan(contracts, codec_module, cuda_runtime):
     _, calls = cuda_runtime
-    context = make_context(api)
+    context = make_context(contracts)
     codec = codec_module.TorchCudaIpcCodec()
     codec.validate_runtime(context)
     codec.synchronize(context)
@@ -256,7 +240,7 @@ def test_consumer_checks_runtime_once_and_sync_does_not_rescan(api, codec_module
 
 
 @pytest.mark.parametrize("invalid", ["gpu", "allocator", "expandable"])
-def test_consumer_runtime_rejects_unsafe_environment(api, codec_module, cuda_runtime, monkeypatch, invalid):
+def test_consumer_runtime_rejects_unsafe_environment(contracts, codec_module, cuda_runtime, monkeypatch, invalid):
     snapshot, _ = cuda_runtime
     if invalid == "gpu":
         monkeypatch.setattr(codec_module, "_device_uuid", lambda index: "GPU-other")
@@ -264,16 +248,16 @@ def test_consumer_runtime_rejects_unsafe_environment(api, codec_module, cuda_run
         monkeypatch.setattr(torch._C, "_cuda_getAllocatorBackend", lambda: "cudaMallocAsync")
     else:
         snapshot["allocator_settings"]["expandable_segments"] = True
-    with pytest.raises((api.CompatibilityError, api.UnsupportedError)):
-        codec_module.TorchCudaIpcCodec().validate_runtime(make_context(api))
+    with pytest.raises((contracts.CompatibilityError, contracts.UnsupportedError)):
+        codec_module.TorchCudaIpcCodec().validate_runtime(make_context(contracts))
 
 
 @pytest.mark.parametrize("codec", ["torch-2.10-native-v1", "torch-2.14-native-v1", "torch-2.13-native-v2"])
-def test_incompatible_codec_is_rejected_before_rebuild(api, codec_module, monkeypatch, mocker, codec):
+def test_incompatible_codec_is_rejected_before_rebuild(contracts, codec_module, monkeypatch, mocker, codec):
     monkeypatch.setattr(torch, "__version__", "2.13.0")
-    descriptor = msgspec.structs.replace(_descriptor(api, codec_module), codec=codec)
+    descriptor = msgspec.structs.replace(_descriptor(contracts, codec_module), codec=codec)
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
-    with pytest.raises(api.UnsupportedError, match="codec"):
+    with pytest.raises(contracts.UnsupportedError, match="codec"):
         codec_module.TorchCudaIpcCodec().import_storage(descriptor, 0)
     rebuild.assert_not_called()
 
@@ -292,30 +276,30 @@ def test_incompatible_codec_is_rejected_before_rebuild(api, codec_module, monkey
         {"event_sync_required": 1},
     ],
 )
-def test_invalid_descriptor_rejected_before_rebuild(api, codec_module, mocker, change):
+def test_invalid_descriptor_rejected_before_rebuild(contracts, codec_module, mocker, change):
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
-    descriptor = msgspec.structs.replace(_descriptor(api, codec_module), **change)
-    with pytest.raises(api.CompatibilityError):
+    descriptor = msgspec.structs.replace(_descriptor(contracts, codec_module), **change)
+    with pytest.raises(contracts.CompatibilityError):
         codec_module.TorchCudaIpcCodec().import_storage(descriptor, 0)
     rebuild.assert_not_called()
 
 
-def test_cuda_uuid_is_normalized_for_nvml_and_mig_prefix_rejected(api, codec_module):
+def test_cuda_uuid_is_normalized_for_nvml_and_mig_prefix_rejected(contracts, codec_module):
     bare_uuid = "12345678-1234-5678-9abc-123456789abc"
     assert codec_module._canonical_gpu_uuid(bare_uuid) == f"GPU-{bare_uuid}"
     assert codec_module._canonical_gpu_uuid(f"GPU-{bare_uuid}") == f"GPU-{bare_uuid}"
-    with pytest.raises(api.UnsupportedError, match="physical"):
+    with pytest.raises(contracts.UnsupportedError, match="physical"):
         codec_module._canonical_gpu_uuid(f"MIG-{bare_uuid}")
 
 
-def test_allocator_snapshot_fails_closed(api, codec_module):
+def test_allocator_snapshot_fails_closed(contracts, codec_module):
     snapshots: tuple[dict[str, object], ...] = (
         {},
         {"allocator_settings": {}},
         {"allocator_settings": {"expandable_segments": True}},
     )
     for snapshot in snapshots:
-        with pytest.raises(api.UnsupportedError):
+        with pytest.raises(contracts.UnsupportedError):
             codec_module._allocator_segments(snapshot)
     segment = {
         "device": 0,

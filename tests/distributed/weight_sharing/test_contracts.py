@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import importlib
 import subprocess
 import sys
 from dataclasses import replace
@@ -13,11 +12,6 @@ import pytest
 from tests.distributed.weight_sharing.helpers import FakeCodec, make_context, make_weights
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-@pytest.fixture
-def contracts(weight_sharing):
-    return importlib.import_module(f"{weight_sharing.__name__}.contracts")
 
 
 @pytest.fixture

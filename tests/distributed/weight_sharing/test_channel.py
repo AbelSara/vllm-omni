@@ -27,11 +27,6 @@ def channel(weight_sharing):
 
 
 @pytest.fixture
-def messages(weight_sharing):
-    return importlib.import_module(f"{weight_sharing.__name__}.contracts")
-
-
-@pytest.fixture
 def sockets():
     left, right = socket.socketpair()
     yield left, right
@@ -66,12 +61,12 @@ def _background(operation, timeout=3):
         assert not thread.is_alive()
 
 
-def test_roundtrip_and_message_boundaries(channel, messages, sockets):
+def test_roundtrip_and_message_boundaries(channel, contracts, sockets):
     limits = channel.Limits(timeout=2)
     sender = channel.FramedConnection(sockets[0], limits)
     receiver = channel.FramedConnection(sockets[1], limits)
-    large = messages.Message("error", "session", 1, error="x" * 20_000)
-    following = messages.Message("accepted", "session", 1)
+    large = contracts.Message("error", "session", 1, error="x" * 20_000)
+    following = contracts.Message("accepted", "session", 1)
 
     def send():
         sender.send(large)
@@ -95,8 +90,8 @@ def test_frame_length_rejected_before_reading_payload(channel, sockets, length):
         receiver.recv()
 
 
-def test_fragmented_header_and_body(channel, messages, sockets):
-    message = messages.Message("accepted", "session", 1)
+def test_fragmented_header_and_body(channel, contracts, sockets):
+    message = contracts.Message("accepted", "session", 1)
     wire = _frame(msgspec.msgpack.encode(message))
     chunks = [wire[:1], wire[1:3], wire[3:4], wire[4:9], wire[9:]]
 
@@ -133,19 +128,19 @@ def test_send_rejects_arbitrary_objects(channel, sockets):
         channel.FramedConnection(sockets[0]).send({"op": "hello"})
 
 
-def test_oversized_bundle_rejected_before_send(channel, messages, sockets):
+def test_oversized_bundle_rejected_before_send(channel, contracts, sockets):
     sender = channel.FramedConnection(sockets[0], channel.Limits(max_bundle_bytes=64))
     with pytest.raises(channel.ChannelError, match="size limit"):
-        sender.send(messages.Message("error", "s", 1, error="x" * 200))
+        sender.send(contracts.Message("error", "s", 1, error="x" * 200))
     sockets[1].setblocking(False)
     with pytest.raises(BlockingIOError):
         sockets[1].recv(1)
 
 
 @pytest.mark.parametrize("wait_for_message", [False, True])
-def test_partial_reads_share_one_deadline(channel, messages, sockets, wait_for_message):
+def test_partial_reads_share_one_deadline(channel, contracts, sockets, wait_for_message):
     receiver = channel.FramedConnection(sockets[1], channel.Limits(timeout=0.15))
-    wire = _frame(msgspec.msgpack.encode(messages.Message("accepted", "s", 1)))
+    wire = _frame(msgspec.msgpack.encode(contracts.Message("accepted", "s", 1)))
     stopped = threading.Event()
 
     def drip():
@@ -169,10 +164,10 @@ def test_partial_reads_share_one_deadline(channel, messages, sockets, wait_for_m
         sent.result(timeout=2)
 
 
-def test_idle_session_can_receive_after_operation_timeout(channel, messages, sockets):
+def test_idle_session_can_receive_after_operation_timeout(channel, contracts, sockets):
     receiver = channel.FramedConnection(sockets[1], channel.Limits(timeout=0.1))
     sender = channel.FramedConnection(sockets[0])
-    message = messages.Message("accepted", "session", 1)
+    message = contracts.Message("accepted", "session", 1)
 
     with _background(lambda: receiver.recv(wait_for_message=True), timeout=1) as received:
         try:
@@ -231,21 +226,21 @@ linux_only = pytest.mark.skipif(sys.platform != "linux", reason="Linux Unix peer
 
 
 @linux_only
-def test_private_unix_endpoint_and_joined_shutdown(channel, messages, tmp_path):
+def test_private_unix_endpoint_and_joined_shutdown(channel, contracts, tmp_path):
     tmp_path.chmod(0o700)
     endpoint = str(tmp_path / "weights.sock")
     handled = threading.Event()
 
     def handler(connection):
         request = connection.recv()
-        connection.send(messages.Message("accepted", request.session_id, request.generation))
+        connection.send(contracts.Message("accepted", request.session_id, request.generation))
         handled.set()
 
     server = channel.SessionServer(endpoint, channel.Limits(timeout=2), handler)
     server.start()
     try:
         with channel.connect(endpoint) as connection:
-            connection.send(messages.Message("hello", "s", 1))
+            connection.send(contracts.Message("hello", "s", 1))
             assert connection.recv().op == "accepted"
         assert handled.wait(2)
         assert os.stat(endpoint).st_mode & 0o777 == 0o600
