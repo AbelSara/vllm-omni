@@ -4,6 +4,9 @@
 
 import gc
 import importlib
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
+from types import ModuleType
 
 import msgspec
 import pytest
@@ -49,7 +52,7 @@ def _spec(contracts, bindings, aliases=None):
 def _descriptor(contracts, codec_module):
     return contracts.StorageExport(
         "storage-0",
-        codec_module._check_torch_version(),
+        codec_module._CODEC_ID,
         3,
         b"handle",
         64,
@@ -170,7 +173,6 @@ def test_integer_device_reduction_schema(contracts, codec_module):
 
 
 def test_import_remaps_to_local_device_and_uses_fixed_rebuild(contracts, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
     codec = codec_module.TorchCudaIpcCodec()
     assert codec.import_storage(_descriptor(contracts, codec_module), 0) is rebuild.return_value
@@ -184,7 +186,6 @@ def test_import_remaps_to_local_device_and_uses_fixed_rebuild(contracts, codec_m
 
 
 def test_rebuild_error_is_propagated_without_counter_cancellation(contracts, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     mocker.patch.object(
         torch.multiprocessing.reductions, "rebuild_cuda_tensor", side_effect=RuntimeError("possibly consumed")
     )
@@ -195,38 +196,9 @@ def test_rebuild_error_is_propagated_without_counter_cancellation(contracts, cod
 
 
 def test_cancel_uses_only_the_supplied_unconsumed_counter(contracts, codec_module, mocker):
-    mocker.patch.object(codec_module, "_check_torch_version", return_value="torch-2.13-native-v1")
     release = mocker.patch.object(torch.storage.TypedStorage, "_release_ipc_counter")
     codec_module.TorchCudaIpcCodec().cancel_unconsumed(_descriptor(contracts, codec_module), 0)
     release.assert_called_once_with(b"counter", 7, device=0)
-
-
-@pytest.mark.parametrize(
-    "version",
-    [
-        "2.9.1",
-        "2.10.0+cpu",
-        "2.10.1+cu130",
-        "2.11.0",
-        "2.12.0",
-        "2.14.0",
-        "2.10.0.dev1",
-        "2.13.0rc1",
-        "2.13.0.dev1",
-        "2.13.0.post1",
-        "2.13.1+cu130",
-    ],
-)
-def test_unknown_abi_rejected(contracts, codec_module, monkeypatch, version):
-    monkeypatch.setattr(torch, "__version__", version)
-    with pytest.raises(contracts.UnsupportedError, match=r"2\.13\.0"):
-        codec_module._check_torch_version()
-
-
-@pytest.mark.parametrize("version", ["2.13.0", "2.13.0+cpu", "2.13.0+cu130"])
-def test_supported_release_abi(codec_module, monkeypatch, version):
-    monkeypatch.setattr(torch, "__version__", version)
-    assert codec_module._check_torch_version() == "torch-2.13-native-v1"
 
 
 def test_consumer_checks_runtime_once_and_sync_does_not_rescan(contracts, codec_module, cuda_runtime):
@@ -252,9 +224,8 @@ def test_consumer_runtime_rejects_unsafe_environment(contracts, codec_module, cu
         codec_module.TorchCudaIpcCodec().validate_runtime(make_context(contracts))
 
 
-@pytest.mark.parametrize("codec", ["torch-2.10-native-v1", "torch-2.14-native-v1", "torch-2.13-native-v2"])
-def test_incompatible_codec_is_rejected_before_rebuild(contracts, codec_module, monkeypatch, mocker, codec):
-    monkeypatch.setattr(torch, "__version__", "2.13.0")
+@pytest.mark.parametrize("codec", ["unknown-codec", "cuda-ipc-v2"])
+def test_incompatible_codec_is_rejected_before_rebuild(contracts, codec_module, mocker, codec):
     descriptor = msgspec.structs.replace(_descriptor(contracts, codec_module), codec=codec)
     rebuild = mocker.patch.object(torch.multiprocessing.reductions, "rebuild_cuda_tensor")
     with pytest.raises(contracts.UnsupportedError, match="codec"):
@@ -290,6 +261,130 @@ def test_cuda_uuid_is_normalized_for_nvml_and_mig_prefix_rejected(contracts, cod
     assert codec_module._canonical_gpu_uuid(f"GPU-{bare_uuid}") == f"GPU-{bare_uuid}"
     with pytest.raises(contracts.UnsupportedError, match="physical"):
         codec_module._canonical_gpu_uuid(f"MIG-{bare_uuid}")
+
+
+_GPU_UUID = "GPU-12345678-1234-5678-9abc-123456789abc"
+_OTHER_GPU_UUID = "GPU-87654321-4321-8765-9abc-123456789abc"
+
+
+@pytest.fixture
+def device_identity(codec_module, monkeypatch, mocker):
+    nvml = mocker.Mock()
+    nvml.NVMLError = type("NVMLError", (Exception,), {})
+    nvml.nvmlDeviceIsMigDeviceHandle.return_value = False
+    properties = mocker.Mock(return_value=(_GPU_UUID.removeprefix("GPU-"),))
+    for name, attribute, value in (
+        ("import_utils", "import_pynvml", lambda: nvml),
+        ("platform_utils", "cuda_get_device_properties", properties),
+    ):
+        module = ModuleType(f"vllm.utils.{name}")
+        setattr(module, attribute, value)
+        monkeypatch.setitem(codec_module.sys.modules, module.__name__, module)
+    process = mocker.Mock()
+    process.getpid.return_value = 101
+    monkeypatch.setattr(codec_module, "os", process, raising=False)
+    monkeypatch.setattr(codec_module, "_validated_gpu_uuids", set(), raising=False)
+    return properties, nvml, process
+
+
+def test_device_uuid_caches_success_per_process_and_physical_gpu(codec_module, device_identity, mocker):
+    properties, nvml, process = device_identity
+    for _ in range(50):
+        assert codec_module._device_uuid(0) == _GPU_UUID
+    assert properties.call_count == 50
+    nvml.nvmlInit.assert_called_once_with()
+    nvml.nvmlShutdown.assert_called_once_with()
+    # Different local ordinals for the same physical UUID reuse its validation.
+    assert codec_module._device_uuid(1) == _GPU_UUID
+    properties.assert_called_with(1, ("uuid",), init_cuda=True)
+    properties.return_value = (_OTHER_GPU_UUID,)
+    assert codec_module._device_uuid(0) == _OTHER_GPU_UUID
+    process.getpid.return_value = 102
+    assert codec_module._device_uuid(0) == _OTHER_GPU_UUID
+    assert nvml.nvmlDeviceGetHandleByUUID.call_args_list == [
+        mocker.call(_GPU_UUID),
+        mocker.call(_OTHER_GPU_UUID),
+        mocker.call(_OTHER_GPU_UUID),
+    ]
+    assert nvml.nvmlInit.call_count == nvml.nvmlShutdown.call_count == 3
+
+
+@pytest.mark.parametrize("failure", ["init", "query", "mig", "shutdown"])
+def test_device_uuid_does_not_cache_failed_validation(contracts, codec_module, device_identity, failure):
+    _, nvml, _ = device_identity
+    operation = {
+        "init": nvml.nvmlInit,
+        "query": nvml.nvmlDeviceGetHandleByUUID,
+        "mig": nvml.nvmlDeviceIsMigDeviceHandle,
+        "shutdown": nvml.nvmlShutdown,
+    }[failure]
+    if failure == "mig":
+        operation.return_value = True
+    else:
+        operation.side_effect = nvml.NVMLError("injected NVML failure")
+    with pytest.raises((contracts.UnsupportedError, nvml.NVMLError)):
+        codec_module._device_uuid(0)
+    operation.side_effect = None
+    nvml.nvmlDeviceIsMigDeviceHandle.return_value = False
+    for _ in range(2):
+        assert codec_module._device_uuid(0) == _GPU_UUID
+    assert nvml.nvmlInit.call_count == 2
+    assert nvml.nvmlShutdown.call_count == (1 if failure == "init" else 2)
+
+
+def test_cached_device_uuid_preserves_runtime_checks(contracts, codec_module, device_identity, request, monkeypatch):
+    properties, nvml, _ = device_identity
+    real_device_uuid = codec_module._device_uuid
+    snapshot, _ = request.getfixturevalue("cuda_runtime")
+    monkeypatch.setattr(codec_module, "_device_uuid", real_device_uuid)
+    context = make_context(contracts, device_uuid=_GPU_UUID)
+    codec = codec_module.TorchCudaIpcCodec()
+    codec.validate_runtime(context)
+    properties.return_value = (_OTHER_GPU_UUID,)
+    with pytest.raises(contracts.CompatibilityError, match="physical GPU UUID differs"):
+        codec.validate_runtime(context)
+    properties.return_value = (_GPU_UUID,)
+    snapshot["allocator_settings"]["expandable_segments"] = True
+    with pytest.raises(contracts.UnsupportedError, match="expandable segments"):
+        codec.validate_runtime(context)
+    assert nvml.nvmlInit.call_count == nvml.nvmlShutdown.call_count == 2
+
+
+def test_device_uuid_serializes_first_validation(codec_module, device_identity, monkeypatch):
+    _, nvml, _ = device_identity
+    entered, release, second_waiting = Event(), Event(), Event()
+
+    class ObservedLock:
+        def __init__(self):
+            self.lock = Lock()
+            self.calls = 0
+
+        def __enter__(self):
+            self.calls += 1
+            if self.calls == 2:
+                second_waiting.set()
+            self.lock.acquire()
+
+        def __exit__(self, *_exc):
+            self.lock.release()
+
+    def initialize():
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(codec_module, "_gpu_uuid_lock", ObservedLock(), raising=False)
+    nvml.nvmlInit.side_effect = initialize
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(codec_module._device_uuid, 0)
+        try:
+            assert entered.wait(5)
+            second = pool.submit(codec_module._device_uuid, 0)
+            assert second_waiting.wait(5)
+        finally:
+            release.set()
+        assert first.result(timeout=5) == second.result(timeout=5) == _GPU_UUID
+    nvml.nvmlInit.assert_called_once_with()
+    nvml.nvmlShutdown.assert_called_once_with()
 
 
 def test_allocator_snapshot_fails_closed(contracts, codec_module):

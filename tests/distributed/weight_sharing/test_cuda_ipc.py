@@ -237,12 +237,14 @@ def test_import_does_not_allocate_a_second_weight_copy(tmp_path: Path, record_pr
         provider.send("release")
 
 
-def test_unexposed_export_is_cancelled_once(tmp_path: Path):
+@pytest.mark.parametrize("rounds", [1, 50], ids=["single", "repeated-lifecycle"])
+def test_unexposed_export_is_cancelled_once(tmp_path: Path, rounds):
     api, backend, context = runtime(str(tmp_path / "unexposed.sock"))
     weights = {"weight": torch.arange(16, dtype=torch.float32, device="cuda:0")}
     spec = api.WeightSpec("m", "r", "l", (api.TensorSpec("weight", "float32", (16,), (1,)),))
-    exported = backend.prepare_export(weights, spec, context)
-    assert backend.release_export(exported).status == "CLOSED"
-    assert backend.release_export(exported).status == "CLOSED"
-    assert backend.session_status(exported).state == api.SessionState.CLOSED
+    for index in range(rounds):
+        exported = backend.prepare_export(weights, spec, _iteration(context, index))
+        assert backend.release_export(exported).status == "CLOSED"
+        assert backend.release_export(exported).status == "CLOSED"
+        assert backend.session_status(exported).state == api.SessionState.CLOSED
     torch.testing.assert_close(weights["weight"].cpu(), torch.arange(16, dtype=torch.float32))

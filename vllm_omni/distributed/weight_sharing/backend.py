@@ -94,6 +94,8 @@ class ImportedWeights(Mapping[str, object]):
         return iter(self._tensors)
 
     def __len__(self) -> int:
+        if not self._active:
+            raise WeightSharingError("import is closing or closed", session_id=self.session_id)
         return len(self._tensors)
 
 
@@ -135,7 +137,7 @@ def _receive(
     if message.session_id != identity.session_id or message.generation != identity.generation:
         raise ProtocolError("message belongs to another session or generation")
     if message.op == "error":
-        raise ProtocolError(message.error or "peer rejected the operation")
+        raise ProtocolError("peer rejected the operation")
     if op is not None and (message.op != op or message.import_id != control.import_id):
         raise ProtocolError(f"expected {op} for the active import")
     return message
@@ -179,17 +181,19 @@ def _serve(control: _Control, connection: FramedConnection) -> None:
         with control.lock:
             control.peer_released = True
             control.state = SessionState.PEER_RELEASED
-    except (OSError, EOFError, WeightSharingError) as exc:
+    except BaseException as exc:
         if claimed:
-            # Transport loss never proves that mappings or counters were released.
+            # A failed handler never proves that mappings or counters were released.
             with control.lock:
                 control.state = SessionState.POISONED
                 control.error = f"{type(exc).__name__}; terminate sharing group"
-        else:
+        elif isinstance(exc, (OSError, EOFError, WeightSharingError)):
             try:
-                connection.send(control.message("error", error=str(exc)))
+                connection.send(control.message("error", error="peer rejected the operation"))
             except (OSError, EOFError, WeightSharingError):
                 pass
+        if not isinstance(exc, (OSError, EOFError, WeightSharingError)):
+            raise
     finally:
         if claimed:
             # Owner shutdown must not interrupt the final release ACK.
@@ -334,13 +338,18 @@ class TorchCudaIpcBackend:
     def open_import(self, endpoint: str, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights:
         if endpoint != context.endpoint:
             raise CompatibilityError("endpoint differs from the session bootstrap")
+        # Reject replay before touching CUDA; _register rechecks after preflight.
+        with self._registry_lock:
+            if context.identity.session_id in self._sessions:
+                raise WeightSharingError("session ID cannot be reused", session_id=context.identity.session_id)
+        # Local preflight creates no IPC references; failures need no session cleanup.
+        validate_spec(expected_spec, self._limits.max_entries)
+        self._codec.validate_runtime(context)
+        self._codec.synchronize(context)
         control = _Control(context, state=SessionState.IMPORTING, import_id=uuid4().hex)
         record = _Consumer(control, current_thread())
         self._register(record)  # A successful or failed session can never be reopened.
         with self._poison_on_error(record):
-            validate_spec(expected_spec, self._limits.max_entries)
-            self._codec.validate_runtime(context)
-            self._codec.synchronize(context)
             connection = connect(endpoint, self._limits)
             record.connection = connection
             connection.send(

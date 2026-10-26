@@ -10,7 +10,6 @@ from dataclasses import replace
 
 import pytest
 import torch
-from packaging.version import Version
 
 from tests.distributed.weight_sharing.helpers import load_weight_sharing, make_context
 
@@ -18,11 +17,8 @@ from tests.distributed.weight_sharing.helpers import load_weight_sharing, make_c
 def require_cuda(num_devices=0):
     # The import-time check must not initialize CUDA: spawned workers can have
     # different CUDA_VISIBLE_DEVICES settings, installed before Process.start().
-    version = Version(torch.__version__)
     if sys.platform != "linux" or torch.version.cuda is None or torch.version.hip is not None:
         pytest.skip("CUDA IPC requires Linux and NVIDIA CUDA", allow_module_level=True)
-    if version.public != "2.13.0":
-        pytest.skip("CUDA IPC requires the PyTorch 2.13.0 release ABI", allow_module_level=True)
     if num_devices and torch.accelerator.device_count() < num_devices:
         pytest.skip(f"CUDA IPC test requires {num_devices} NVIDIA GPU(s)")
 

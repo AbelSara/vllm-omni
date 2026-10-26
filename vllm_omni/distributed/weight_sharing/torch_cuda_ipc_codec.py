@@ -9,8 +9,10 @@ created or consumed. The caller must retain resources and poison that session.
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Mapping
+from threading import Lock
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
@@ -32,20 +34,13 @@ if TYPE_CHECKING:
     from torch.multiprocessing.reductions import StorageWeakRef
 
 
-# Pinned to PyTorch 2.13.0's reductions.py, StorageSharing.cpp and allocator
-# snapshots. Other releases require an explicit ABI review.
-_CODEC_VERSION = "torch-2.13-native-v1"
+# Depends on PyTorch 2.13.0's reducer, storage-sharing and allocator interfaces.
+_CODEC_ID = "cuda-ipc-v1"
 
-
-def _check_torch_version() -> str:
-    import torch
-    from packaging.version import Version
-
-    version = Version(torch.__version__)
-    # Local build tags such as +cu130 do not change the release ABI.
-    if version.public != "2.13.0":
-        raise UnsupportedError("CUDA weight sharing supports the PyTorch 2.13.0 release ABI only")
-    return _CODEC_VERSION
+# Cache successful physical-GPU checks, never NVML handles. The PID prevents
+# inherited metadata from being reused by a different process.
+_validated_gpu_uuids: set[tuple[int, str]] = set()
+_gpu_uuid_lock = Lock()
 
 
 def _byte_carrier(tensor: torch.Tensor) -> torch.Tensor:
@@ -152,24 +147,28 @@ def _device_uuid(device_index: int) -> str:
     (uuid,) = cuda_get_device_properties(device_index, ("uuid",), init_cuda=True)
     device_uuid = _canonical_gpu_uuid(str(uuid))
     # CUDA can expose a MIG instance while NVML's physical index identifies its
-    # parent. Resolve the actual CUDA UUID and fail closed on MIG/unknown UUIDs.
-    nvml = import_pynvml()
-    nvml.nvmlInit()
-    try:
-        handle = nvml.nvmlDeviceGetHandleByUUID(device_uuid)
-        if nvml.nvmlDeviceIsMigDeviceHandle(handle):
-            raise UnsupportedError("MIG instances are unsupported")
-    except nvml.NVMLError as exc:
-        raise UnsupportedError("cannot resolve the CUDA UUID to a full physical GPU") from exc
-    finally:
-        nvml.nvmlShutdown()
+    # parent. Validate each actual UUID once; repeated NVML init/shutdown can
+    # hang on some driver stacks when interleaved with CUDA IPC operations.
+    key = (os.getpid(), device_uuid)
+    with _gpu_uuid_lock:
+        if key not in _validated_gpu_uuids:
+            nvml = import_pynvml()
+            nvml.nvmlInit()
+            try:
+                handle = nvml.nvmlDeviceGetHandleByUUID(device_uuid)
+                if nvml.nvmlDeviceIsMigDeviceHandle(handle):
+                    raise UnsupportedError("MIG instances are unsupported")
+            except nvml.NVMLError as exc:
+                raise UnsupportedError("cannot resolve the CUDA UUID to a full physical GPU") from exc
+            finally:
+                nvml.nvmlShutdown()
+            _validated_gpu_uuids.add(key)
     return device_uuid
 
 
 def _runtime_snapshot(context: SessionContext) -> list[dict[str, object]]:
     import torch
 
-    _check_torch_version()
     if sys.platform != "linux" or torch.version.cuda is None or torch.version.hip is not None:
         raise UnsupportedError("CUDA weight sharing requires Linux and NVIDIA CUDA")
     if torch.accelerator.current_accelerator(check_available=True) != torch.device("cuda"):
@@ -185,7 +184,7 @@ def _runtime_snapshot(context: SessionContext) -> list[dict[str, object]]:
 
 
 def _validate_descriptor(descriptor: StorageExport) -> None:
-    if descriptor.codec != _check_torch_version():
+    if descriptor.codec != _CODEC_ID:
         raise UnsupportedError(f"unsupported CUDA IPC codec: {descriptor.codec}")
     if not descriptor.storage_id:
         raise CompatibilityError("storage identity must be nonempty")
@@ -220,7 +219,7 @@ def _encode_reduction(args: tuple[object, ...], storage_id: str, nbytes: int) ->
         raise UnsupportedError("unexpected PyTorch CUDA reducer ABI for a byte carrier")
     descriptor = StorageExport(
         storage_id=storage_id,
-        codec=_check_torch_version(),
+        codec=_CODEC_ID,
         device_index=cast(int, args[6]),
         handle=cast(bytes, args[7]),
         storage_nbytes=cast(int, args[8]),
@@ -285,7 +284,6 @@ class TorchCudaIpcCodec:
         import torch
         from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
 
-        _check_torch_version()
         if type(carrier) is not torch.Tensor:
             raise UnsupportedError("a plain tensor byte carrier is required")
         if (

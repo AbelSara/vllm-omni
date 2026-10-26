@@ -98,6 +98,7 @@ def test_roundtrip_preserves_views_and_close_is_idempotent(r):
     exported = r.provider.prepare_export(bindings, spec, r.context)
     imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
     server = r.transport.servers[r.context.endpoint]
+    assert len(imported) == len(spec.tensors)
     assert r.provider.session_status(exported).error == ""
     assert r.consumer.session_status(imported).error == ""
     assert imported["first"].storage is imported["second"].storage
@@ -106,6 +107,9 @@ def test_roundtrip_preserves_views_and_close_is_idempotent(r):
     assert imported["first"].storage.data is bindings["first"].storage.data
     assert r.provider.release_export(exported).status == "HELD"
     assert r.consumer.close_import(imported).status == "CLOSED"
+    for access in (len, iter, lambda weights: weights["first"]):
+        with pytest.raises(r.api.WeightSharingError, match="closing or closed"):
+            access(imported)
     assert r.consumer.close_import(imported).status == "CLOSED"
     assert r.provider.release_export(exported).status == "CLOSED"
     assert len(server.connections) == 1
@@ -122,19 +126,38 @@ def test_roundtrip_preserves_views_and_close_is_idempotent(r):
     assert {thread for _, thread in r.codec.calls} == {threading.get_ident()}
 
 
-def test_consumer_runtime_rejection_precedes_connection_and_cuda_operations(r, monkeypatch):
+@pytest.mark.parametrize("check", ["spec", "validate_runtime", "synchronize"])
+def test_consumer_preflight_failure_does_not_create_session(r, monkeypatch, check):
     bindings, spec, exported = r.publish()
     r.codec.calls.clear()
 
-    def reject_runtime(context):
-        r.codec._called("validate_runtime")
-        raise r.api.UnsupportedError("injected unsupported runtime")
+    def reject(context):
+        r.codec._called(check)
+        raise r.api.UnsupportedError("injected preflight failure")
 
-    monkeypatch.setattr(r.codec, "validate_runtime", reject_runtime)
-    with pytest.raises(r.api.WeightSharingError, match="UnsupportedError"):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert r.codec.calls == [("validate_runtime", threading.get_ident())]
+    with monkeypatch.context() as patch:
+        expected = spec
+        if check == "spec":
+            expected = msgspec.structs.replace(spec, tensors=(r.api.TensorSpec("weight", "unknown", (1,)),))
+        else:
+            patch.setattr(r.codec, check, reject)
+        with pytest.raises(r.api.WeightSharingError) as failure:
+            r.consumer.open_import(r.context.endpoint, expected, r.context)
+        assert not failure.value.poisoned
+    expected_calls = {
+        "spec": [],
+        "validate_runtime": ["validate_runtime"],
+        "synchronize": ["validate_runtime", "synchronize"],
+    }
+    assert [name for name, _ in r.codec.calls] == expected_calls[check]
+    with pytest.raises(r.api.WeightSharingError, match="unknown session"):
+        r.consumer.session_status(r.context.identity.session_id)
     assert not r.transport.servers[r.context.endpoint].connections
+    assert not r.codec.imports
+    assert r.provider.session_status(exported).state == r.api.SessionState.EXPORTED
+    # No session was created: fixing the input/environment permits a first import.
+    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
+    assert r.consumer.close_import(imported).status == "CLOSED"
     assert r.provider.release_export(exported).status == "CLOSED"
 
 
@@ -142,12 +165,16 @@ def test_import_identity_cannot_be_reopened(r):
     bindings, spec, exported = r.publish()
     imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
     server = r.transport.servers[r.context.endpoint]
+    calls = list(r.codec.calls)
     with pytest.raises(r.api.WeightSharingError):
         r.consumer.open_import(r.context.endpoint, spec, r.context)
+    assert r.codec.calls == calls
     assert len(server.connections) == len(r.codec.imports) == 1
     assert r.consumer.close_import(imported).status == "CLOSED"
+    calls = list(r.codec.calls)
     with pytest.raises(r.api.WeightSharingError):
         r.consumer.open_import(r.context.endpoint, spec, r.context)
+    assert r.codec.calls == calls
     assert len(server.connections) == len(r.codec.imports) == 1
     assert r.provider.release_export(exported).status == "CLOSED"
 
@@ -313,6 +340,43 @@ def test_lost_import_ack_poisoned_and_rebuild_is_not_repeated(r):
         r.consumer.open_import(r.context.endpoint, spec, r.context)
     assert len(server.connections) == len(r.codec.imports) == 1
     r.assert_poisoned_pair(exported)
+
+
+@pytest.mark.parametrize("op", ["manifest", "bundle", "accepted", "released"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, TypeError])
+def test_unexpected_provider_handler_failure_is_queryable(r, op, error_type):
+    bindings, spec, exported = r.publish()
+    source = weakref.ref(bindings["first"].storage)
+    del bindings
+
+    def fail_send(message):
+        if message.op == op:
+            raise error_type("injected unexpected handler failure")
+
+    r.transport.before_send = fail_send
+    with pytest.raises(r.api.WeightSharingError):
+        imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
+        r.consumer.close_import(imported)
+    assert r.transport.servers[r.context.endpoint].handled.wait(timeout=3)
+    snapshot = r.provider.session_status(exported)
+    assert snapshot.state == r.api.SessionState.POISONED
+    assert snapshot.error == f"{error_type.__name__}; terminate sharing group"
+    assert source() is not None
+    assert r.provider.release_export(exported).status == "POISONED"
+    assert not r.codec.cancellations
+
+
+@pytest.mark.parametrize(
+    "peer_error", ["", "untrusted\nFORGED LOG ENTRY", "x" * 65536], ids=["empty", "multiline", "long"]
+)
+def test_peer_error_text_is_not_propagated(r, mocker, peer_error):
+    control = r.backend._Control(r.context)
+    connection = mocker.Mock()
+    connection.recv.return_value = control.message("error", error=peer_error)
+    with pytest.raises(r.api.ProtocolError) as failure:
+        r.backend._receive(control, connection)
+    assert str(failure.value) == "peer rejected the operation"
+    assert failure.value.__cause__ is None
 
 
 def test_lost_release_ack_poisoned_without_reconnecting(r):
