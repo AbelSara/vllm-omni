@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Event, Lock, Thread, current_thread
+from typing import cast
 from uuid import uuid4
 
 from .channel import FramedConnection, Limits, SessionServer, connect
@@ -23,6 +24,7 @@ from .contracts import (
     CloseResult,
     CompatibilityError,
     CudaIpcCodec,
+    FdPassingCodec,
     Message,
     MessageOp,
     PreparedWeights,
@@ -49,6 +51,8 @@ class _Control:
     state: SessionState = SessionState.PREPARING
     manifest: WeightManifest | None = None
     exports: list[StorageExport] = field(default_factory=list)
+    # Provider-owned fds per export with fd_count > 0, sent after the bundle.
+    fd_groups: list[tuple[int, ...]] = field(default_factory=list)
     active_storage_id: str | None = None
     import_id: str = ""
     closing: bool = False
@@ -168,7 +172,10 @@ def _serve(control: _Control, connection: FramedConnection) -> None:
                 raise ProtocolError("session is closing")
             # Claiming the batch already prohibits cancellation, even if send fails.
             exports = tuple(control.exports)
+            fd_groups = tuple(control.fd_groups)
         connection.send(control.message("bundle", import_id=control.import_id, exports=exports))
+        if fd_groups:
+            connection.send_fds(fd_groups)
         # CUDA import and model use can outlive the per-message IO timeout.
         _receive(control, connection, "imported", wait_for_message=True)
         with control.lock:
@@ -297,6 +304,12 @@ class TorchCudaIpcBackend:
                     )
                     with control.lock:
                         control.exports.append(descriptor)
+                    if descriptor.fd_count:
+                        fds = tuple(cast(FdPassingCodec, self._codec).export_fds(descriptor))
+                        if len(fds) != descriptor.fd_count:
+                            raise CompatibilityError("codec returned a different number of fds")
+                        with control.lock:
+                            control.fd_groups.append(fds)
         with control.lock:
             control.state = SessionState.EXPORTED
         # Only CPU metadata is captured by this callback, never tensor owners.
@@ -332,6 +345,7 @@ class TorchCudaIpcBackend:
                 or d.device_index < 0
                 or d.allocation_offset_bytes < 0
                 or d.ref_counter_offset < 0
+                or not 0 <= d.fd_count <= 16
             ):
                 raise CompatibilityError("invalid storage export descriptor")
 
@@ -369,6 +383,10 @@ class TorchCudaIpcBackend:
                 control.exports = list(bundle.exports)
             for descriptor in bundle.exports:
                 with _storage_operation(control, descriptor.storage_id):
+                    if descriptor.fd_count:
+                        # Frames arrive in export order; the codec owns and closes the fds.
+                        fds = connection.recv_fds(descriptor.fd_count)
+                        cast(FdPassingCodec, self._codec).receive_fds(descriptor, fds)
                     carrier = self._codec.import_storage(descriptor, context.device_index)
                     with control.lock:
                         record.carriers[descriptor.storage_id] = carrier
@@ -441,11 +459,16 @@ class TorchCudaIpcBackend:
             if control.import_id and not control.peer_released:
                 return CloseResult("HELD")
             cancellable = control.exports if not control.import_id else ()
+            # The peer confirmed its unmapping; fd-based handles still need a provider release.
+            consumed = [d for d in control.exports if d.fd_count] if control.import_id else []
             control.state = SessionState.RELEASING
         with self._poison_on_error(record):
             for descriptor in cancellable:
                 with _storage_operation(control, descriptor.storage_id):
                     self._codec.cancel_unconsumed(descriptor, control.context.device_index)
+            for descriptor in consumed:
+                with _storage_operation(control, descriptor.storage_id):
+                    cast(FdPassingCodec, self._codec).release_consumed(descriptor, control.context.device_index)
             # Stop/join outside the state lock; the CPU thread never owns sources.
             if record.server is not None:
                 record.server.stop()
