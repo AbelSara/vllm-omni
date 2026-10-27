@@ -206,10 +206,8 @@ def test_cancel_uses_only_the_supplied_unconsumed_counter(contracts, codec_modul
     release.assert_called_once_with(b"counter", 7, device=0)
 
 
-@pytest.mark.parametrize("expandable", [False, True])
-def test_consumer_checks_runtime_once_and_sync_does_not_rescan(contracts, codec_module, cuda_runtime, expandable):
-    snapshot, calls = cuda_runtime
-    snapshot["allocator_settings"]["expandable_segments"] = expandable
+def test_consumer_checks_runtime_once_and_sync_does_not_rescan(contracts, codec_module, cuda_runtime):
+    _, calls = cuda_runtime
     context = make_context(contracts)
     codec = codec_module.TorchCudaIpcCodec()
     codec.validate_runtime(context)
@@ -218,15 +216,12 @@ def test_consumer_checks_runtime_once_and_sync_does_not_rescan(contracts, codec_
     assert calls == [("select", 0), ("snapshot", None), ("sync", 0), ("sync", 0)]
 
 
-@pytest.mark.parametrize("invalid", ["gpu", "allocator", "unknown_settings"])
+@pytest.mark.parametrize("invalid", ["gpu", "allocator"])
 def test_consumer_runtime_rejects_unsafe_environment(contracts, codec_module, cuda_runtime, monkeypatch, invalid):
-    snapshot, _ = cuda_runtime
     if invalid == "gpu":
         monkeypatch.setattr(codec_module, "_device_uuid", lambda index: "GPU-other")
-    elif invalid == "allocator":
-        monkeypatch.setattr(torch._C, "_cuda_getAllocatorBackend", lambda: "cudaMallocAsync")
     else:
-        snapshot["allocator_settings"]["expandable_segments"] = None
+        monkeypatch.setattr(torch._C, "_cuda_getAllocatorBackend", lambda: "cudaMallocAsync")
     with pytest.raises((contracts.CompatibilityError, contracts.UnsupportedError)):
         codec_module.TorchCudaIpcCodec().validate_runtime(make_context(contracts))
 
@@ -400,33 +395,21 @@ def test_device_uuid_serializes_first_validation(codec_module, device_identity, 
 
 
 def test_allocator_snapshot_fails_closed(contracts, codec_module):
-    snapshots: tuple[dict[str, object], ...] = (
-        {},
-        {"allocator_settings": {}},
-        {"allocator_settings": {"expandable_segments": True}},  # Missing segments.
-        {"allocator_settings": {"expandable_segments": 1}, "segments": []},
-        {"allocator_settings": {"expandable_segments": False}, "segments": [None]},
-    )
+    snapshots: tuple[object, ...] = (None, {}, {"segments": None}, {"segments": [None]})
     for snapshot in snapshots:
         with pytest.raises(contracts.UnsupportedError):
             codec_module._allocator_segments(snapshot)
     segment = {
         "device": 0,
-        "is_expandable": False,
         "segment_pool_id": (0, 0),
         "blocks": [{"address": 1024, "size": 256, "state": "active_allocated"}],
     }
-    for expandable in (False, True):
-        segment["is_expandable"] = expandable
-        snapshot = {"allocator_settings": {"expandable_segments": expandable}, "segments": [segment]}
-        assert codec_module._allocator_segments(snapshot) == [segment]
-        assert codec_module._native_blocks([segment], 0) == {1024: 256}
-        assert codec_module._native_blocks([segment], 1) == {}
-        for change in (
-            {"is_expandable": None},
-            {"is_expandable": 1},
-            {"segment_pool_id": (0, 1)},
-            {"segment_pool_id": None},
-            {"blocks": [{"address": 1024, "size": 256, "state": "inactive"}]},
-        ):
-            assert codec_module._native_blocks([dict(segment, **change)], 0) == {}
+    assert codec_module._allocator_segments({"segments": [segment]}) == [segment]
+    assert codec_module._native_blocks([segment], 0) == {1024: 256}
+    assert codec_module._native_blocks([segment], 1) == {}
+    for change in (
+        {"segment_pool_id": (0, 1)},
+        {"segment_pool_id": None},
+        {"blocks": [{"address": 1024, "size": 256, "state": "inactive"}]},
+    ):
+        assert codec_module._native_blocks([dict(segment, **change)], 0) == {}

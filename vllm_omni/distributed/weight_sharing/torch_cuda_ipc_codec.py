@@ -99,12 +99,9 @@ def _describe_bindings(bindings: Mapping[str, object], spec: WeightSpec) -> Prep
 
 
 def _allocator_segments(snapshot: object) -> list[dict[str, object]]:
-    """Fail closed on unknown allocator snapshots instead of assuming native."""
+    """Read allocation segments from a native allocator snapshot."""
     if not isinstance(snapshot, dict):
         raise UnsupportedError("unsupported allocator snapshot")
-    settings = snapshot.get("allocator_settings")
-    if not isinstance(settings, dict) or type(settings.get("expandable_segments")) is not bool:
-        raise UnsupportedError("unknown allocator settings are unsupported")
     segments = snapshot.get("segments")
     if not isinstance(segments, list) or any(not isinstance(segment, dict) for segment in segments):
         raise UnsupportedError("unsupported allocator segment metadata")
@@ -117,7 +114,7 @@ def _native_blocks(segments: list[dict[str, object]], device_index: int) -> dict
     for segment in segments:
         if segment.get("device") != device_index:
             continue
-        if type(segment.get("is_expandable")) is not bool or segment.get("segment_pool_id") not in ((0, 0), [0, 0]):
+        if segment.get("segment_pool_id") not in ((0, 0), [0, 0]):
             continue
         blocks = segment.get("blocks")
         if not isinstance(blocks, list):
