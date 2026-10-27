@@ -4,6 +4,7 @@
 
 import importlib
 import multiprocessing
+import os
 import sys
 from contextlib import contextmanager
 from dataclasses import replace
@@ -47,6 +48,23 @@ def receive(pipe, expected=None, timeout=45):
     if expected is not None:
         assert message == expected
     return message
+
+
+def assert_export_allocations(bindings):
+    """Verify the real allocation kind, not just the worker's requested setting."""
+    expandable = "expandable_segments:True" in os.environ.get("PYTORCH_ALLOC_CONF", "")
+    snapshot = torch.cuda.memory._snapshot()
+    assert snapshot["allocator_settings"]["expandable_segments"] is expandable
+    for tensor in bindings.values():
+        storage = tensor.untyped_storage()
+        if not storage.nbytes():
+            continue
+        owners = [
+            segment
+            for segment in snapshot["segments"]
+            if segment["address"] <= storage.data_ptr() < segment["address"] + segment["total_size"]
+        ]
+        assert len(owners) == 1 and owners[0]["is_expandable"] is expandable
 
 
 @contextmanager

@@ -10,7 +10,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.distributed.weight_sharing.cuda_helpers import receive, require_cuda, runtime, spawn_workers
+from tests.distributed.weight_sharing.cuda_helpers import (
+    assert_export_allocations,
+    receive,
+    require_cuda,
+    runtime,
+    spawn_workers,
+)
 from tests.distributed.weight_sharing.helpers import load_weight_sharing
 from tests.helpers.mark import hardware_marks
 
@@ -20,7 +26,7 @@ pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_ca
 
 
 @pytest.fixture(autouse=True)
-def supported_runtime():
+def supported_runtime(ipc_allocator):
     require_cuda(1)
 
 
@@ -55,6 +61,7 @@ def _provider(endpoint, fault, control):
         patch.setattr(channel.FramedConnection, "send", send)
         patch.setattr(backend._codec, "cancel_unconsumed", cancel)
         weights = {name: torch.arange(32, dtype=torch.float32, device="cuda:0") for name in ("a", "b")}
+        assert_export_allocations(weights)
         sources = [weakref.ref(value) for value in weights.values()]
         exported = backend.prepare_export(weights, _spec(api), context)
         del weights

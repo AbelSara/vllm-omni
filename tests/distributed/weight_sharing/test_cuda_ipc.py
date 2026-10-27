@@ -11,7 +11,13 @@ import msgspec
 import pytest
 import torch
 
-from tests.distributed.weight_sharing.cuda_helpers import receive, require_cuda, runtime, spawn_workers
+from tests.distributed.weight_sharing.cuda_helpers import (
+    assert_export_allocations,
+    receive,
+    require_cuda,
+    runtime,
+    spawn_workers,
+)
 from tests.distributed.weight_sharing.helpers import make_tensor_specs
 from tests.helpers.mark import hardware_marks
 
@@ -20,7 +26,7 @@ pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_ca
 
 
 @pytest.fixture(autouse=True)
-def supported_runtime():
+def supported_runtime(ipc_allocator):
     require_cuda(1)
 
 
@@ -80,6 +86,7 @@ def _provider(endpoint, rounds, control):
             assert not stream.query(), "export synchronization test needs pending writes"
         exported = backend.prepare_export(bindings, spec, _iteration(context, index))
         assert stream.query()
+        assert_export_allocations(bindings)
         del bindings
         snapshot = backend.session_status(exported)
         assert snapshot.storage_count == 6
@@ -183,9 +190,9 @@ def _large_spec(api, nbytes):
 
 def _large_provider(endpoint, nbytes, control):
     api, backend, context = runtime(endpoint)
-    exported = backend.prepare_export(
-        {"weight": torch.ones(nbytes // 4, device="cuda:0")}, _large_spec(api, nbytes), context
-    )
+    weights = {"weight": torch.ones(nbytes // 4, device="cuda:0")}
+    assert_export_allocations(weights)
+    exported = backend.prepare_export(weights, _large_spec(api, nbytes), context)
     control.send("ready")
     receive(control, "release")
     assert backend.release_export(exported).status == "CLOSED"
@@ -195,6 +202,7 @@ def _memory_consumer(endpoint, nbytes, control):
     api, backend, context = runtime(endpoint)
     # Warm the context and allocator before measuring. Run on an otherwise idle GPU.
     warmup = torch.ones(1024, device="cuda:0")
+    assert_export_allocations({"warmup": warmup})
     torch.accelerator.synchronize(0)
     del warmup
     torch.accelerator.memory.empty_cache()
@@ -221,14 +229,23 @@ def _memory_consumer(endpoint, nbytes, control):
 
 
 @pytest.mark.parametrize("nbytes", [128 * 1024 * 1024, 256 * 1024 * 1024], ids=["128MiB", "256MiB"])
-def test_import_does_not_allocate_a_second_weight_copy(tmp_path: Path, record_property, nbytes):
+@pytest.mark.parametrize("same_allocator", [True, False], ids=["matching", "mixed"])
+def test_import_does_not_allocate_a_second_weight_copy(
+    tmp_path: Path, record_property, nbytes, same_allocator, ipc_allocator
+):
     endpoint = str(tmp_path / "large.sock")
-    with spawn_workers((_large_provider, (endpoint, nbytes)), (_memory_consumer, (endpoint, nbytes))) as workers:
+    consumer_expandable = ipc_allocator if same_allocator else not ipc_allocator
+    consumer_env = {"PYTORCH_ALLOC_CONF": f"backend:native,expandable_segments:{consumer_expandable}"}
+    with spawn_workers(
+        (_large_provider, (endpoint, nbytes)), (_memory_consumer, (endpoint, nbytes), consumer_env)
+    ) as workers:
         (_, provider), (consumer_process, consumer) = workers
         receive(provider, "ready")
         consumer.send("import")
         peak, driver_delta, copied = receive(consumer)
         record_property("shared_weight_bytes", nbytes)
+        record_property("provider_expandable", ipc_allocator)
+        record_property("consumer_expandable", consumer_expandable)
         record_property("import_peak_bytes", peak)
         record_property("import_device_delta_bytes", driver_delta)
         record_property("copy_control_bytes", copied)
@@ -237,10 +254,10 @@ def test_import_does_not_allocate_a_second_weight_copy(tmp_path: Path, record_pr
         provider.send("release")
 
 
-@pytest.mark.parametrize("rounds", [1, 50], ids=["single", "repeated-lifecycle"])
-def test_unexposed_export_is_cancelled_once(tmp_path: Path, rounds):
-    api, backend, context = runtime(str(tmp_path / "unexposed.sock"))
+def _unexposed_provider(endpoint, rounds, control):
+    api, backend, context = runtime(endpoint)
     weights = {"weight": torch.arange(16, dtype=torch.float32, device="cuda:0")}
+    assert_export_allocations(weights)
     spec = api.WeightSpec("m", "r", "l", (api.TensorSpec("weight", "float32", (16,), (1,)),))
     for index in range(rounds):
         exported = backend.prepare_export(weights, spec, _iteration(context, index))
@@ -248,3 +265,10 @@ def test_unexposed_export_is_cancelled_once(tmp_path: Path, rounds):
         assert backend.release_export(exported).status == "CLOSED"
         assert backend.session_status(exported).state == api.SessionState.CLOSED
     torch.testing.assert_close(weights["weight"].cpu(), torch.arange(16, dtype=torch.float32))
+    control.send("closed")
+
+
+@pytest.mark.parametrize("rounds", [1, 50], ids=["single", "repeated-lifecycle"])
+def test_unexposed_export_is_cancelled_once(tmp_path: Path, rounds):
+    with spawn_workers((_unexposed_provider, (str(tmp_path / "unexposed.sock"), rounds))) as workers:
+        receive(workers[0][1], "closed")

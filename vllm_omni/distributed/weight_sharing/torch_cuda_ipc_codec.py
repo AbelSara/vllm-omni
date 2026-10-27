@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 # Depends on PyTorch 2.13.0's reducer, storage-sharing and allocator interfaces.
 _CODEC_ID = "cuda-ipc-v1"
+# Expandable allocations encode multiple physical handles in one opaque payload.
+_MAX_MEMORY_HANDLE_BYTES = 1024 * 1024
 
 # Cache successful physical-GPU checks, never NVML handles. The PID prevents
 # inherited metadata from being reused by a different process.
@@ -101,8 +103,8 @@ def _allocator_segments(snapshot: object) -> list[dict[str, object]]:
     if not isinstance(snapshot, dict):
         raise UnsupportedError("unsupported allocator snapshot")
     settings = snapshot.get("allocator_settings")
-    if not isinstance(settings, dict) or settings.get("expandable_segments") is not False:
-        raise UnsupportedError("expandable segments and unknown allocator settings are unsupported")
+    if not isinstance(settings, dict) or type(settings.get("expandable_segments")) is not bool:
+        raise UnsupportedError("unknown allocator settings are unsupported")
     segments = snapshot.get("segments")
     if not isinstance(segments, list) or any(not isinstance(segment, dict) for segment in segments):
         raise UnsupportedError("unsupported allocator segment metadata")
@@ -115,7 +117,7 @@ def _native_blocks(segments: list[dict[str, object]], device_index: int) -> dict
     for segment in segments:
         if segment.get("device") != device_index:
             continue
-        if segment.get("is_expandable") is not False or segment.get("segment_pool_id") not in ((0, 0), [0, 0]):
+        if type(segment.get("is_expandable")) is not bool or segment.get("segment_pool_id") not in ((0, 0), [0, 0]):
             continue
         blocks = segment.get("blocks")
         if not isinstance(blocks, list):
@@ -196,8 +198,12 @@ def _validate_descriptor(descriptor: StorageExport) -> None:
     )
     if any(type(value) is not int or value < 0 for value in integers) or descriptor.storage_nbytes == 0:
         raise CompatibilityError("invalid CUDA IPC storage size, device or offset")
-    for handle in (descriptor.handle, descriptor.ref_counter_handle, descriptor.event_handle):
-        if not isinstance(handle, bytes) or not 0 < len(handle) <= 4096:
+    for handle, limit in (
+        (descriptor.handle, _MAX_MEMORY_HANDLE_BYTES),
+        (descriptor.ref_counter_handle, 4096),
+        (descriptor.event_handle, 4096),
+    ):
+        if not isinstance(handle, bytes) or not 0 < len(handle) <= limit:
             raise CompatibilityError("invalid CUDA IPC handle")
     if type(descriptor.event_sync_required) is not bool:
         raise CompatibilityError("invalid CUDA IPC event state")
@@ -249,10 +255,13 @@ class _TorchStorageLease:
 
 
 class TorchCudaIpcCodec:
-    """A narrow adapter for supported native, non-expandable PyTorch storages.
+    """A narrow adapter for native PyTorch storages, including expandable segments.
 
     Methods are called by the backend's owner thread. No method starts a thread,
     repacks tensors, or falls back to copying unsupported allocations.
+    PyTorch owns expandable handle export/import and mapping. Its POSIX FD path
+    requires permission to use pidfd_open/pidfd_getfd between the worker processes;
+    allocations must have IPC handles enabled when created.
     """
 
     def inspect(self, bindings: Mapping[str, object], spec: WeightSpec, context: SessionContext) -> PreparedWeights:

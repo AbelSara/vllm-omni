@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unsupported real CUDA allocators are rejected before exporting IPC handles."""
+"""Unsupported allocators and expandable allocations without IPC handles fail closed."""
 
 from pathlib import Path
 
 import pytest
 import torch
 
-from tests.distributed.weight_sharing.cuda_helpers import receive, require_cuda, runtime, spawn_workers
+from tests.distributed.weight_sharing.cuda_helpers import (
+    assert_export_allocations,
+    receive,
+    require_cuda,
+    runtime,
+    spawn_workers,
+)
 from tests.helpers.mark import hardware_marks
 
 require_cuda()
@@ -36,11 +42,13 @@ def _unsupported_allocator(endpoint, mode, expected_error, control):
         assert owners and all(tuple(segment["segment_pool_id"]) != (0, 0) for segment in owners)
     else:
         weight = torch.ones(1024, dtype=torch.float32, device="cuda:0")
+        if mode == "ipc_disabled":
+            assert_export_allocations({"weight": weight})
 
     spec = api.WeightSpec("guard-test", "revision", "flat", (api.TensorSpec("weight", "float32", (1024,)),))
     with pytest.raises(api.WeightSharingError) as error:
         backend.prepare_export({"weight": weight}, spec, context)
-    assert isinstance(error.value.__cause__, api.UnsupportedError)
+    assert isinstance(error.value.__cause__, RuntimeError if mode == "ipc_disabled" else api.UnsupportedError)
     assert expected_error in str(error.value.__cause__)
     assert backend.session_status(context.identity.session_id).exported_storage_ids == ()
     assert not Path(endpoint).exists()
@@ -52,10 +60,10 @@ def _unsupported_allocator(endpoint, mode, expected_error, control):
     [
         pytest.param("async_allocator", "backend:cudaMallocAsync", "only the native", id="cudaMallocAsync"),
         pytest.param(
-            "expandable_segments",
+            "ipc_disabled",
             "backend:native,expandable_segments:True",
-            "expandable segments",
-            id="expandable_segments",
+            "IPC handles are disabled",
+            id="expandable-ipc-disabled",
         ),
         pytest.param(
             "private_pool", "backend:native,expandable_segments:False", "outside private pools", id="private_pool"
@@ -72,8 +80,29 @@ def test_unsupported_allocator_rejected_before_export(
         (
             _unsupported_allocator,
             (str(tmp_path / "a.sock"), mode, expected_error),
-            {"PYTORCH_ALLOC_CONF": allocator_conf},
+            {
+                "PYTORCH_ALLOC_CONF": allocator_conf,
+                "TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC": "0" if mode == "ipc_disabled" else "1",
+            },
         )
     ) as workers:
         ((_, control),) = workers
         receive(control, "checked")
+
+
+def _async_consumer(endpoint, control):
+    api, backend, context = runtime(endpoint)
+    spec = api.WeightSpec("guard-test", "revision", "flat", (api.TensorSpec("weight", "float32", (1024,)),))
+    with pytest.raises(api.UnsupportedError, match="only the native"):
+        backend.open_import(endpoint, spec, context)
+    with pytest.raises(api.WeightSharingError, match="unknown session"):
+        backend.session_status(context.identity.session_id)
+    control.send("checked")
+
+
+def test_consumer_rejects_async_allocator_before_connect(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    with spawn_workers(
+        (_async_consumer, (str(tmp_path / "absent.sock"),), {"PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync"})
+    ) as workers:
+        receive(workers[0][1], "checked")
