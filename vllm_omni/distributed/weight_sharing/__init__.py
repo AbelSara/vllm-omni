@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Independent CUDA storage sharing; importing this package does not start CUDA.
 
-Callers supply finalized read-only weights, matching rank/GPU identities, and
-an endpoint in a private directory. Model binding and process supervision are
-owned by callers. See the contracts and backend module docstrings for lifetime
-requirements; this package does not replace the request KV connector.
+Callers supply finalized read-only weights and matching rank/GPU identities.
+They route opaque metadata over their existing trusted control plane and report
+uncertain delivery/peer failures to the backend. No socket or thread is created.
+Model binding and process supervision remain with callers; this package does
+not replace the request KV connector.
 """
 
 from .backend import ExportSession, ImportedWeights, TorchCudaIpcBackend
@@ -13,6 +14,7 @@ from .contracts import (
     CloseResult,
     CompatibilityError,
     Identity,
+    Limits,
     SessionContext,
     SessionSnapshot,
     SessionState,
@@ -29,6 +31,7 @@ __all__ = [
     "CompatibilityError",
     "ExportSession",
     "Identity",
+    "Limits",
     "ImportedWeights",
     "SessionContext",
     "SessionSnapshot",

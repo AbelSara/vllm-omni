@@ -1,33 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Persistent weight mappings with CPU-only control and owner-thread cleanup.
+"""Transport-independent weight mappings with owner-thread resource operations.
 
-Closing a socket is never evidence that an IPC mapping has been released.
-The caller must keep this backend alive, stop model use before close_import,
-and terminate the sharing group when a snapshot is POISONED. Sessions use one
-connection from import through release; a failed session cannot reconnect.
+The trusted caller routes opaque metadata through its control plane, pairs ranks,
+reports uncertain delivery/peer failures via mark_failed, and terminates poisoned
+sharing groups. This module starts no threads and performs no network I/O.
+Keep the backend alive until teardown; never replay a bundle into a replacement
+consumer. A lost RPC response is not evidence that CUDA resources were released.
 """
 
 from __future__ import annotations
 
-import hmac
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import partial
-from threading import Event, Lock, Thread, current_thread
+from threading import Lock, Thread, current_thread
+from typing import Literal, TypeVar
 from uuid import uuid4
 
-from .channel import FramedConnection, Limits, SessionServer, connect
+import msgspec
+
 from .contracts import (
     CloseResult,
     CompatibilityError,
     CudaIpcCodec,
-    Message,
-    MessageOp,
+    ExportBundle,
+    Limits,
     PreparedWeights,
     ProtocolError,
     SessionContext,
+    SessionReceipt,
     SessionSnapshot,
     SessionState,
     StorageExport,
@@ -40,10 +42,12 @@ from .contracts import (
     validate_spec,
 )
 
+_Metadata = TypeVar("_Metadata", ExportBundle, SessionReceipt)
+
 
 @dataclass
 class _Control:
-    """Only CPU metadata is reachable from the socket handler."""
+    """CPU metadata shared with read-only status queries."""
 
     context: SessionContext
     state: SessionState = SessionState.PREPARING
@@ -51,16 +55,9 @@ class _Control:
     exports: list[StorageExport] = field(default_factory=list)
     active_storage_id: str | None = None
     import_id: str = ""
-    closing: bool = False
     peer_released: bool = False
     error: str = ""
     lock: Lock = field(default_factory=Lock)
-    release_complete: Event = field(default_factory=Event)
-    message: partial[Message] = field(init=False)
-
-    def __post_init__(self) -> None:
-        identity = self.context.identity
-        self.message = partial(Message, session_id=identity.session_id, generation=identity.generation)
 
 
 @dataclass(frozen=True)
@@ -77,9 +74,10 @@ class ImportedWeights(Mapping[str, object]):
     its contents.
     """
 
-    def __init__(self, session_id: str, manifest: WeightManifest, tensors: dict[str, object]):
+    def __init__(self, session_id: str, manifest: WeightManifest, tensors: dict[str, object], receipt: bytes):
         self.session_id = session_id
         self.manifest = manifest
+        self.receipt = receipt
         self._tensors = tensors
         self._active = True
 
@@ -104,7 +102,6 @@ class _Provider:
     control: _Control
     owner: Thread
     prepared: PreparedWeights | None = None
-    server: SessionServer | None = None
 
 
 @dataclass
@@ -114,9 +111,7 @@ class _Consumer:
     carriers: dict[str, object] = field(default_factory=dict)
     leases: list[StorageLease] = field(default_factory=list)
     result: ImportedWeights | None = None
-    connection: FramedConnection | None = None
     local_complete: bool = False
-    peer_confirmed: bool = False
 
 
 @contextmanager
@@ -129,83 +124,27 @@ def _storage_operation(control: _Control, storage_id: str) -> Iterator[None]:
         control.active_storage_id = None
 
 
-def _receive(
-    control: _Control, connection: FramedConnection, op: MessageOp | None = None, *, wait_for_message: bool = False
-) -> Message:
-    message = connection.recv(wait_for_message=wait_for_message)
-    identity = control.context.identity
-    if message.session_id != identity.session_id or message.generation != identity.generation:
-        raise ProtocolError("message belongs to another session or generation")
-    if message.op == "error":
-        raise ProtocolError("peer rejected the operation")
-    if op is not None and (message.op != op or message.import_id != control.import_id):
-        raise ProtocolError(f"expected {op} for the active import")
-    return message
-
-
-def _serve(control: _Control, connection: FramedConnection) -> None:
-    """One CPU-only handshake and release; never reconnect or replay handles."""
-    claimed = False
-    try:
-        hello = _receive(control, connection)
-        if (
-            hello.op != "hello"
-            or not hello.import_id
-            or hello.identity != control.context.identity
-            or not hmac.compare_digest(hello.token, control.context.token)
-        ):
-            raise ProtocolError("peer identity or authentication does not match")
-        with control.lock:
-            if control.closing or control.import_id or control.state != SessionState.EXPORTED:
-                raise ProtocolError("session no longer accepts imports")
-            manifest = control.manifest
-            control.import_id = hello.import_id
-            claimed = True
-        connection.send(control.message("manifest", manifest=manifest))
-        _receive(control, connection, "get_bundle")
-        with control.lock:
-            if control.closing:
-                raise ProtocolError("session is closing")
-            # Claiming the batch already prohibits cancellation, even if send fails.
-            exports = tuple(control.exports)
-        connection.send(control.message("bundle", import_id=control.import_id, exports=exports))
-        # CUDA import and model use can outlive the per-message IO timeout.
-        _receive(control, connection, "imported", wait_for_message=True)
-        with control.lock:
-            control.state = SessionState.ATTACHED
-        connection.send(control.message("accepted", import_id=control.import_id))
-        _receive(control, connection, "release", wait_for_message=True)
-        with control.lock:
-            control.state = SessionState.RELEASING
-        connection.send(control.message("released", import_id=control.import_id))
-        with control.lock:
-            control.peer_released = True
-            control.state = SessionState.PEER_RELEASED
-    except BaseException as exc:
-        if claimed:
-            # A failed handler never proves that mappings or counters were released.
-            with control.lock:
-                control.state = SessionState.POISONED
-                control.error = f"{type(exc).__name__}; terminate sharing group"
-        elif isinstance(exc, (OSError, EOFError, WeightSharingError)):
-            try:
-                connection.send(control.message("error", error="peer rejected the operation"))
-            except (OSError, EOFError, WeightSharingError):
-                pass
-        if not isinstance(exc, (OSError, EOFError, WeightSharingError)):
-            raise
-    finally:
-        if claimed:
-            # Owner shutdown must not interrupt the final release ACK.
-            control.release_complete.set()
-
-
 class TorchCudaIpcBackend:
     """One backend per owner; session_status may be queried by other threads.
 
     The codec is injectable for independent CPU tests. Production callers should
     use the default TorchCudaIpcCodec, which rejects unsupported devices/ABIs.
-    No worker, scheduler, KV connector or process manager is imported here.
+    All mutations execute on the owner thread, including control-plane receipts
+    and failure reports. No worker, scheduler or process manager is imported here.
+    The caller authenticates/routes metadata; identity checks here prevent stale
+    or misrouted messages, not a malicious control-plane participant.
+
+    Normal flow (each call runs on its respective owner):
+      provider.prepare_export(...) -> export
+      provider.claim_export(export) -> bundle bytes
+      consumer.open_import(bundle, expected_spec, context) -> weights
+      provider.confirm_import(weights.receipt)
+      consumer.close_import(weights) -> local result, possibly HELD
+      provider.confirm_release(result.receipt)  # only after local completion
+      provider.release_export(export)
+
+    Relay bytes, never ImportedWeights or tensors, through the caller's RPCs.
+    Receipts can be delivered again; an import with an uncertain outcome cannot.
     """
 
     def __init__(self, *, codec: CudaIpcCodec | None = None, limits: Limits | None = None):
@@ -255,19 +194,39 @@ class TorchCudaIpcBackend:
             yield
         except BaseException as exc:
             error = self._failure(record.control, exc, poisoned=True)
-            if isinstance(record, _Consumer):
-                if record.result is not None:
-                    record.result._active = False
-                self._close_connection(record)
+            if isinstance(record, _Consumer) and record.result is not None:
+                record.result._active = False
             if not isinstance(exc, Exception):
                 raise
             raise error from exc
 
+    def _decode(self, payload: bytes, cls: type[_Metadata]) -> _Metadata:
+        if type(payload) is not bytes or not 0 < len(payload) <= self._limits.max_bundle_bytes:
+            raise ProtocolError("invalid metadata payload size")
+        try:
+            return msgspec.msgpack.decode(payload, type=cls)
+        except msgspec.DecodeError as exc:
+            raise ProtocolError("invalid metadata payload") from exc
+
     @staticmethod
-    def _close_connection(record: _Consumer) -> None:
-        if record.connection is not None:
-            record.connection.close()
-            record.connection = None
+    def _receipt(control: _Control, op: Literal["imported", "released"]) -> bytes:
+        return msgspec.msgpack.encode(SessionReceipt(control.context.identity, control.import_id, op))
+
+    def mark_failed(self, handle_or_session_id: ExportSession | ImportedWeights | str) -> None:
+        """Report an uncertain control-plane outcome; never infer safe cleanup.
+
+        Invoke on each surviving owner after a peer crash or RPC timeout. No
+        automatic peer monitoring remains here. A failed import may not have
+        registered a local session if it was rejected during resource-free preflight.
+        """
+        record = self._get(handle_or_session_id)
+        with record.control.lock:
+            if record.control.state == SessionState.POISONED:
+                return
+            record.control.state = SessionState.POISONED
+            record.control.error = "control-plane outcome uncertain; terminate sharing group"
+        if isinstance(record, _Consumer) and record.result is not None:
+            record.result._active = False
 
     def prepare_export(
         self, bindings: Mapping[str, object], weight_spec: WeightSpec, context: SessionContext
@@ -299,22 +258,63 @@ class TorchCudaIpcBackend:
                         control.exports.append(descriptor)
         with control.lock:
             control.state = SessionState.EXPORTED
-        # Only CPU metadata is captured by this callback, never tensor owners.
-        record.server = SessionServer(context.endpoint, self._limits, lambda connection: _serve(control, connection))
-        try:
-            record.server.start()
-        except Exception as exc:
-            raise self._failure(control, exc) from exc
         return ExportSession(context.identity.session_id, manifest)
 
-    @staticmethod
-    def _exchange(record: _Consumer, op: MessageOp, expected_reply: MessageOp) -> None:
-        connection = record.connection
-        if connection is None:
-            raise ProtocolError("import connection is closed")
+    def claim_export(self, handle_or_session_id: ExportSession | str) -> bytes:
+        """Return one bounded bundle, marking exposure BEFORE returning it.
+
+        Even if delivery fails, cancellation is no longer safe. The caller must
+        not resend this bundle to another consumer or retry an uncertain import.
+        """
+        record = self._get(handle_or_session_id)
+        if not isinstance(record, _Provider):
+            raise WeightSharingError("claim_export requires a provider session")
         control = record.control
-        connection.send(control.message(op, import_id=control.import_id))
-        _receive(control, connection, expected_reply)
+        with control.lock:
+            if control.state != SessionState.EXPORTED or control.import_id:
+                raise ProtocolError("session no longer accepts imports")
+            assert control.manifest is not None
+            import_id = uuid4().hex
+            bundle = ExportBundle(control.context.identity, import_id, control.manifest, tuple(control.exports))
+            payload = msgspec.msgpack.encode(bundle)
+            if len(payload) > self._limits.max_bundle_bytes:
+                raise ProtocolError("metadata exceeds size limit")
+            control.import_id = import_id
+            control.state = SessionState.CLAIMED
+        return payload
+
+    def _confirm(self, payload: bytes, op: Literal["imported", "released"]) -> None:
+        receipt = self._decode(payload, SessionReceipt)
+        record = self._get(receipt.identity.session_id)
+        if not isinstance(record, _Provider):
+            raise ProtocolError("confirmation requires a provider session")
+        control = record.control
+        with control.lock:
+            if (
+                receipt.identity != control.context.identity
+                or not control.import_id
+                or receipt.import_id != control.import_id
+                or receipt.op != op
+            ):
+                raise ProtocolError("receipt differs from the claimed session")
+            allowed = (SessionState.CLAIMED, SessionState.ATTACHED) if op == "imported" else (SessionState.ATTACHED,)
+            # Repeated receipts are harmless; they never repeat device operations
+            # or roll back a later state. Bundles, unlike receipts, are single-use.
+            if control.state in (SessionState.PEER_RELEASED, SessionState.CLOSED):
+                return
+            if control.state not in allowed:
+                raise ProtocolError("receipt is out of order or session failed")
+            if op == "imported":
+                control.state = SessionState.ATTACHED
+            else:
+                control.peer_released = True
+                control.state = SessionState.PEER_RELEASED
+
+    def confirm_import(self, receipt: bytes) -> None:
+        self._confirm(receipt, "imported")
+
+    def confirm_release(self, receipt: bytes) -> None:
+        self._confirm(receipt, "released")
 
     @staticmethod
     def _validate_exports(manifest: WeightManifest, exports: tuple[StorageExport, ...]) -> None:
@@ -335,38 +335,31 @@ class TorchCudaIpcBackend:
             ):
                 raise CompatibilityError("invalid storage export descriptor")
 
-    def open_import(self, endpoint: str, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights:
-        if endpoint != context.endpoint:
-            raise CompatibilityError("endpoint differs from the session bootstrap")
+    def open_import(self, payload: bytes, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights:
         # Reject replay before touching CUDA; _register rechecks after preflight.
         with self._registry_lock:
             if context.identity.session_id in self._sessions:
                 raise WeightSharingError("session ID cannot be reused", session_id=context.identity.session_id)
         # Local preflight creates no IPC references; failures need no session cleanup.
         validate_spec(expected_spec, self._limits.max_entries)
+        bundle = self._decode(payload, ExportBundle)
+        if bundle.identity != context.identity or not bundle.import_id:
+            raise CompatibilityError("bundle identity differs from the expected rank pair")
+        manifest = bundle.manifest
+        validate_manifest(manifest, expected_spec, self._limits.max_entries)
+        self._validate_exports(manifest, bundle.exports)
         self._codec.validate_runtime(context)
         self._codec.synchronize(context)
-        control = _Control(context, state=SessionState.IMPORTING, import_id=uuid4().hex)
+        control = _Control(
+            context,
+            state=SessionState.IMPORTING,
+            import_id=bundle.import_id,
+            manifest=manifest,
+            exports=list(bundle.exports),
+        )
         record = _Consumer(control, current_thread())
-        self._register(record)  # A successful or failed session can never be reopened.
+        self._register(record)  # A successful or uncertain import can never be reopened.
         with self._poison_on_error(record):
-            connection = connect(endpoint, self._limits)
-            record.connection = connection
-            connection.send(
-                control.message("hello", import_id=control.import_id, identity=context.identity, token=context.token)
-            )
-            reply = _receive(control, connection)
-            if reply.op != "manifest" or reply.manifest is None:
-                raise ProtocolError("expected manifest")
-            manifest = reply.manifest
-            validate_manifest(manifest, expected_spec, self._limits.max_entries)
-            with control.lock:
-                control.manifest = manifest
-            connection.send(control.message("get_bundle", import_id=control.import_id))
-            bundle = _receive(control, connection, "bundle")
-            self._validate_exports(manifest, bundle.exports)
-            with control.lock:
-                control.exports = list(bundle.exports)
             for descriptor in bundle.exports:
                 with _storage_operation(control, descriptor.storage_id):
                     carrier = self._codec.import_storage(descriptor, context.device_index)
@@ -382,8 +375,9 @@ class TorchCudaIpcBackend:
                     del carrier
             tensors = self._codec.make_views(manifest, record.carriers)
             self._codec.synchronize(context)
-            record.result = ImportedWeights(context.identity.session_id, manifest, tensors)
-            self._exchange(record, "imported", "accepted")
+            record.result = ImportedWeights(
+                context.identity.session_id, manifest, tensors, self._receipt(control, "imported")
+            )
             with control.lock:
                 control.state = SessionState.MAPPED
             return record.result
@@ -394,9 +388,9 @@ class TorchCudaIpcBackend:
             raise WeightSharingError("close_import requires a consumer session")
         control = record.control
         if control.state == SessionState.POISONED:
-            return CloseResult("POISONED", record.local_complete, record.peer_confirmed)
+            return CloseResult("POISONED", record.local_complete)
         if control.state == SessionState.CLOSED:
-            return CloseResult("CLOSED", record.local_complete, record.peer_confirmed)
+            return CloseResult("CLOSED", True, receipt=self._receipt(control, "released"))
         with control.lock:
             control.state = SessionState.RELEASING
         with self._poison_on_error(record):
@@ -409,18 +403,15 @@ class TorchCudaIpcBackend:
                 carriers, record.carriers = record.carriers, {}
             carriers.clear()  # Destroy CUDA owners outside the state lock.
             if any(not lease.expired() for lease in record.leases):
-                # Local aliases may be dropped later; retain the same connection.
+                # Local aliases may be dropped later; the caller can retry close.
                 return CloseResult("HELD")
             for lease in record.leases:
                 lease.close()
             record.leases.clear()
             record.local_complete = True
-            self._exchange(record, "release", "released")
-            record.peer_confirmed = True
-            self._close_connection(record)
             with control.lock:
                 control.state = SessionState.CLOSED
-            return CloseResult("CLOSED", True, True)
+            return CloseResult("CLOSED", True, receipt=self._receipt(control, "released"))
 
     def release_export(self, handle_or_session_id: ExportSession | str) -> CloseResult:
         record = self._get(handle_or_session_id)
@@ -428,15 +419,10 @@ class TorchCudaIpcBackend:
             raise WeightSharingError("release_export requires a provider session")
         control = record.control
         with control.lock:
-            awaiting_ack = control.state == SessionState.RELEASING and bool(control.import_id)
-        if awaiting_ack:
-            control.release_complete.wait(self._limits.timeout)
-        with control.lock:
             if control.state == SessionState.CLOSED:
                 return CloseResult("CLOSED", True, control.peer_released)
             if control.state == SessionState.POISONED:
                 return CloseResult("POISONED")
-            control.closing = True
             # An empty-weight bundle still binds an import that must be closed.
             if control.import_id and not control.peer_released:
                 return CloseResult("HELD")
@@ -446,9 +432,6 @@ class TorchCudaIpcBackend:
             for descriptor in cancellable:
                 with _storage_operation(control, descriptor.storage_id):
                     self._codec.cancel_unconsumed(descriptor, control.context.device_index)
-            # Stop/join outside the state lock; the CPU thread never owns sources.
-            if record.server is not None:
-                record.server.stop()
             record.prepared = None
             with control.lock:
                 control.state = SessionState.CLOSED

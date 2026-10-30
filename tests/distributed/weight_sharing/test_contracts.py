@@ -45,11 +45,15 @@ def test_context_rejects_invalid_pairing(contracts, changes):
         make_context(contracts, **changes)
 
 
-def test_context_hides_token_in_repr(contracts):
-    context = make_context(contracts)
-    assert context.token.decode() not in repr(context)
+def test_context_rejects_negative_device(contracts):
     with pytest.raises(ValueError):
-        replace(context, token=b"short")
+        replace(make_context(contracts), device_index=-1)
+
+
+@pytest.mark.parametrize("changes", [{"max_entries": 0}, {"max_bundle_bytes": 0}, {"max_bundle_bytes": 2**32}])
+def test_metadata_limits(contracts, changes):
+    with pytest.raises(ValueError):
+        contracts.Limits(**changes)
 
 
 @pytest.mark.parametrize(
@@ -129,9 +133,11 @@ def test_manifest_rejects_unreferenced_storage(contracts, manifest):
 
 
 def test_protocol_decoder_rejects_unknown_fields(contracts):
-    payload = msgspec.msgpack.encode({"op": "hello", "session_id": "session", "generation": 1, "callable": "bad"})
+    payload = msgspec.msgpack.encode(
+        {"identity": make_context(contracts).identity, "import_id": "i", "op": "imported", "callable": "bad"}
+    )
     with pytest.raises(msgspec.ValidationError, match="unknown field"):
-        msgspec.msgpack.decode(payload, type=contracts.Message)
+        msgspec.msgpack.decode(payload, type=contracts.SessionReceipt)
 
 
 def test_independent_package_import_and_backend_construction_are_lazy():

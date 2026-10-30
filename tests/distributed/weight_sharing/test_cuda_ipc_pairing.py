@@ -3,7 +3,6 @@
 """Physical GPU pairing with different process-local CUDA ordinals."""
 
 import importlib
-from pathlib import Path
 
 import pytest
 import torch
@@ -27,21 +26,27 @@ def _spec(api):
     return api.WeightSpec("paired-model", "revision", "tp2-final", (api.TensorSpec("weight", "float32", (8, 8)),))
 
 
-def _provider(endpoint, rank, control):
-    api, backend, context = runtime(endpoint, rank=rank, tp_size=2, device_index=rank)
+def _provider(rank, control):
+    api, backend, context = runtime(rank=rank, tp_size=2, device_index=rank)
     weights = {"weight": torch.full((8, 8), rank + 1.0, device=f"cuda:{rank}")}
     exported = backend.prepare_export(weights, _spec(api), context)
-    control.send(("ready", context.identity.device_uuid))
-    receive(control, "release")
-    assert backend.release_export(exported).status == "CLOSED"
+    control.send((context.identity.device_uuid, backend.claim_export(exported)))
+    outcome = receive(control)
+    if outcome == "rejected":
+        backend.mark_failed(exported)
+        assert backend.release_export(exported).status == "POISONED"
+    else:
+        backend.confirm_import(outcome)
+        control.send("attached")
+        backend.confirm_release(receive(control))
+        assert backend.release_export(exported).status == "CLOSED"
     control.send("closed")
 
 
-def _consumer(endpoint, rank, mismatch, control):
-    receive(control, "import")
+def _consumer(rank, mismatch, control):
+    payload = receive(control)
     device_index = rank if mismatch == "device" else 1 - rank
     api, backend, context = runtime(
-        endpoint,
         rank=1 - rank if mismatch == "rank" else rank,
         tp_size=2,
         device_index=device_index,
@@ -58,52 +63,49 @@ def _consumer(endpoint, rank, mismatch, control):
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(backend._codec, "import_storage", counted_import)
             with pytest.raises(api.WeightSharingError):
-                backend.open_import(endpoint, _spec(api), context)
+                backend.open_import(payload, _spec(api), context)
         assert calls == 0
-        snapshot = backend.session_status(context.identity.session_id)
-        assert snapshot.state == api.SessionState.POISONED
-        assert snapshot.imported_storage_ids == ()
-        assert snapshot.active_storage_id is None
+        with pytest.raises(api.WeightSharingError, match="unknown session"):
+            backend.session_status(context.identity.session_id)
+        control.send("rejected")
     else:
-        imported = backend.open_import(endpoint, _spec(api), context)
+        imported = backend.open_import(payload, _spec(api), context)
+        control.send(imported.receipt)
+        receive(control, "attached")
         assert imported["weight"].device.index == device_index
         output = torch.ones((2, 8), device=f"cuda:{device_index}") @ imported["weight"]
         torch.testing.assert_close(output.cpu(), torch.full((2, 8), 8.0 * (rank + 1)))
-        assert backend.close_import(imported).status == "CLOSED"
-    control.send("done")
+        result = backend.close_import(imported)
+        assert result.status == "CLOSED"
+        control.send(result.receipt)
 
 
-def _check_pairs(tmp_path, gpu_uuids, ranks, mismatch=None):
+def _check_pairs(gpu_uuids, ranks, mismatch=None):
     workers = []
     for rank in ranks:
-        endpoint = str(tmp_path / f"rank-{rank}.sock")
         workers.extend(
             [
-                (_provider, (endpoint, rank), {"CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids)}),
-                (_consumer, (endpoint, rank, mismatch), {"CUDA_VISIBLE_DEVICES": ",".join(reversed(gpu_uuids))}),
+                (_provider, (rank,), {"CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids)}),
+                (_consumer, (rank, mismatch), {"CUDA_VISIBLE_DEVICES": ",".join(reversed(gpu_uuids))}),
             ]
         )
     with spawn_workers(*workers) as started:
-        providers, consumers = started[::2], started[1::2]
-        for rank, (_, control) in zip(ranks, providers):
-            receive(control, ("ready", gpu_uuids[rank]))
-        for _, control in consumers:
-            control.send("import")
-        for process, control in consumers:
-            receive(control, "done")
-            process.join(timeout=30)
-            assert process.exitcode == 0
-        for _, control in providers:
-            control.send("release")
-        for _, control in providers:
-            receive(control, "closed")
-    assert not list(tmp_path.glob("*.sock"))
+        for rank, (_, provider), (_, consumer) in zip(ranks, started[::2], started[1::2]):
+            device_uuid, payload = receive(provider)
+            assert device_uuid == gpu_uuids[rank]
+            consumer.send(payload)
+            provider.send(receive(consumer))
+            if not mismatch:
+                receive(provider, "attached")
+                consumer.send("attached")
+                provider.send(receive(consumer))
+            receive(provider, "closed")
 
 
-def test_rank_pairs_share_with_reversed_visible_device_order(tmp_path: Path, gpu_uuids):
-    _check_pairs(tmp_path, gpu_uuids, (0, 1))
+def test_rank_pairs_share_with_reversed_visible_device_order(gpu_uuids):
+    _check_pairs(gpu_uuids, (0, 1))
 
 
 @pytest.mark.parametrize("mismatch", ["rank", "device"])
-def test_wrong_rank_or_physical_gpu_is_rejected_before_import(tmp_path: Path, gpu_uuids, mismatch):
-    _check_pairs(tmp_path, gpu_uuids, (0,), mismatch)
+def test_wrong_rank_or_physical_gpu_is_rejected_before_import(gpu_uuids, mismatch):
+    _check_pairs(gpu_uuids, (0,), mismatch)

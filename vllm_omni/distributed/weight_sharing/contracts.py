@@ -10,7 +10,7 @@ are equal. None of these descriptors contains tensor data or Python callables.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -46,6 +46,7 @@ class ThreadOwnershipError(WeightSharingError):
 class SessionState(str, Enum):
     PREPARING = "PREPARING"
     EXPORTED = "EXPORTED"
+    CLAIMED = "CLAIMED"
     ATTACHED = "ATTACHED"
     IMPORTING = "IMPORTING"
     MAPPED = "MAPPED"
@@ -71,17 +72,25 @@ class Identity(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class SessionContext:
     identity: Identity
     device_index: int
-    endpoint: str
-    token: bytes = field(repr=False)
 
     def __post_init__(self) -> None:
         i = self.identity
-        if not all((i.group_id, i.session_id, i.provider_id, i.consumer_id, i.device_uuid, self.endpoint)):
-            raise ValueError("session identity and endpoint must be nonempty")
+        if not all((i.group_id, i.session_id, i.provider_id, i.consumer_id, i.device_uuid)):
+            raise ValueError("session identity must be nonempty")
         if i.protocol_version != 1 or i.generation < 0 or not 0 <= i.rank < i.tp_size:
             raise ValueError("invalid protocol version, generation or TP rank")
-        if self.device_index < 0 or len(self.token) < 16:
-            raise ValueError("device index must be nonnegative and token at least 16 bytes")
+        if self.device_index < 0:
+            raise ValueError("device index must be nonnegative")
+
+
+@dataclass(frozen=True)
+class Limits:
+    max_bundle_bytes: int = 64 * 1024 * 1024
+    max_entries: int = 100_000
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_bundle_bytes <= (1 << 32) - 1 or self.max_entries < 1:
+            raise ValueError("metadata size and entry limits must be positive and bounded")
 
 
 class TensorSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -135,29 +144,21 @@ class StorageExport(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     event_sync_required: bool
 
 
-MessageOp = Literal[
-    "hello",
-    "manifest",
-    "get_bundle",
-    "bundle",
-    "imported",
-    "accepted",
-    "release",
-    "released",
-    "error",
-]
+class ExportBundle(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """One delivery to the consumer named by identity; never replay this bundle."""
+
+    identity: Identity
+    import_id: str
+    manifest: WeightManifest
+    exports: tuple[StorageExport, ...]
 
 
-class Message(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    op: MessageOp
-    session_id: str
-    generation: int
-    import_id: str = ""
-    identity: Identity | None = None
-    token: bytes = b""
-    manifest: WeightManifest | None = None
-    exports: tuple[StorageExport, ...] = ()
-    error: str = ""
+class SessionReceipt(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """A local outcome relayed by a trusted caller, not an authentication token."""
+
+    identity: Identity
+    import_id: str
+    op: Literal["imported", "released"]
 
 
 @dataclass
@@ -224,9 +225,16 @@ class SessionSnapshot:
 
 @dataclass(frozen=True)
 class CloseResult:
+    """CLOSED is local completion; only a provider can confirm peer release.
+
+    A consumer's receipt may be relayed again without repeating CUDA cleanup.
+    The caller must deliver it before releasing the provider's resources.
+    """
+
     status: Literal["CLOSED", "HELD", "POISONED"]
     local_complete: bool = False
     peer_confirmed: bool = False
+    receipt: bytes | None = None
 
 
 class WeightSharingBackend(Protocol):
@@ -234,7 +242,15 @@ class WeightSharingBackend(Protocol):
         self, bindings: Mapping[str, object], weight_spec: WeightSpec, context: SessionContext
     ) -> ExportSession: ...
 
-    def open_import(self, endpoint: str, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights: ...
+    def claim_export(self, handle_or_session_id: ExportSession | str) -> bytes: ...
+
+    def open_import(self, payload: bytes, expected_spec: WeightSpec, context: SessionContext) -> ImportedWeights: ...
+
+    def confirm_import(self, receipt: bytes) -> None: ...
+
+    def confirm_release(self, receipt: bytes) -> None: ...
+
+    def mark_failed(self, handle_or_session_id: ExportSession | ImportedWeights | str) -> None: ...
 
     def session_status(self, handle_or_session_id: ExportSession | ImportedWeights | str) -> SessionSnapshot: ...
 

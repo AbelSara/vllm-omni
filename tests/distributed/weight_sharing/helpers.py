@@ -5,19 +5,17 @@
 from __future__ import annotations
 
 import importlib.util
-import queue
-import socket
+import multiprocessing
 import sys
 import threading
 import weakref
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from vllm_omni.distributed.weight_sharing.channel import FramedConnection, Limits
+import pytest
 
 
 def load_weight_sharing() -> ModuleType:
@@ -61,7 +59,7 @@ def make_tensor_specs(api, bindings, aliases=None):
     )
 
 
-def make_context(api, endpoint: str = "unused", **identity_changes):
+def make_context(api, **identity_changes):
     identity = {
         "group_id": "group",
         "generation": 1,
@@ -73,7 +71,7 @@ def make_context(api, endpoint: str = "unused", **identity_changes):
         "device_uuid": "GPU-test",
     }
     identity.update(identity_changes)
-    return api.SessionContext(api.Identity(**identity), 0, endpoint, b"test-token-at-least-sixteen-bytes")
+    return api.SessionContext(api.Identity(**identity), 0)
 
 
 @dataclass
@@ -109,7 +107,7 @@ class FakeCodec:
     """Replace only GPU primitives while exercising the actual backend.
 
     The backend still owns its real locks, registry, batch transitions and
-    socket protocol. Import creates a distinct lifetime token whose payload
+    receipt checks. Import creates a distinct lifetime token whose payload
     references the provider's data, so retaining a returned view prevents close.
     """
 
@@ -229,86 +227,76 @@ def make_weights(api, *, two_storages: bool = False):
     return bindings, spec
 
 
-class _SocketPairServer:
-    def __init__(
-        self,
-        transport: SocketPairTransport,
-        endpoint: str,
-        handler: Callable[[FramedConnection], None],
-    ) -> None:
-        self.transport = transport
-        self.endpoint = endpoint
-        self.handler = handler
-        self.incoming: queue.Queue[FramedConnection | None] = queue.Queue()
-        self.connections: list[FramedConnection] = []
-        self.handled = threading.Event()
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.last_error: Exception | None = None
+def receive(pipe, expected=None, timeout=45):
+    assert pipe.poll(timeout), f"worker timed out waiting for {expected!r}"
+    message = pipe.recv()
+    if expected is not None:
+        assert message == expected
+    return message
 
-    def start(self) -> None:
-        if self.endpoint in self.transport.servers:
-            raise self.transport.channel.ChannelError("Endpoint already registered")
-        self.transport.servers[self.endpoint] = self
-        self.thread.start()
 
-    def run(self) -> None:
-        while True:
-            connection = self.incoming.get()
-            if connection is None:
-                return
+def publish_to_parent(backend, exported, control):
+    """Device owners expose bytes only; the parent relays the control plane."""
+    control.send(backend.claim_export(exported))
+    backend.confirm_import(receive(control))
+    control.send("attached")
+
+
+def release_from_parent(backend, exported, control):
+    backend.confirm_release(receive(control))
+    assert backend.release_export(exported).status == "CLOSED"
+    control.send("closed")
+
+
+def relay_import(provider, consumer):
+    consumer.send(receive(provider))
+    provider.send(receive(consumer))
+    receive(provider, "attached")
+    consumer.send("attached")
+
+
+def relay_release(provider, consumer):
+    provider.send(receive(consumer))
+    receive(provider, "closed")
+
+
+@contextmanager
+def spawn_workers(*workers):
+    """Start (target, args[, env]) workers, appending their control pipe argument."""
+    context = multiprocessing.get_context("spawn")
+    running = []
+    try:
+        for worker in workers:
+            target, args = worker[:2]
+            parent, child = context.Pipe()
+            process = context.Process(target=target, args=(*args, child))
+            running.append((process, parent))
             try:
-                self.handler(connection)
-            except Exception as error:
-                self.last_error = error
+                with pytest.MonkeyPatch.context() as patch:
+                    for key, value in (worker[2] if len(worker) == 3 else {}).items():
+                        patch.setenv(key, value)
+                    process.start()
             finally:
-                connection.close()
-                self.handled.set()
-
-    def stop(self) -> None:
-        for connection in self.connections:
-            connection.close()
-        self.incoming.put(None)
-        if self.thread.ident is not None:
-            self.thread.join(timeout=5)
-            assert not self.thread.is_alive(), "Backend left its socket handler running"
-        self.transport.servers.pop(self.endpoint, None)
-
-
-class SocketPairTransport:
-    """Exercise real framed socket I/O without depending on AF_UNIX locally.
-
-    Linux endpoint permissions and peer identity are tested separately against
-    the production SessionServer. This adapter replaces only bind/connect.
-    """
-
-    def __init__(self, channel: ModuleType) -> None:
-        self.channel = channel
-        self.servers: dict[str, _SocketPairServer] = {}
-        self.before_send: Callable[[object], object | None] | None = None
-
-    def server(self, endpoint: str, limits: Limits, handler: Callable[[FramedConnection], None]) -> _SocketPairServer:
-        return _SocketPairServer(self, endpoint, handler)
-
-    def connect(self, endpoint: str, limits: Limits) -> FramedConnection:
-        client_socket, server_socket = socket.socketpair()
-        client = self.channel.FramedConnection(client_socket, limits)
-        server = self.channel.FramedConnection(server_socket, limits)
-        send = server.send
-
-        def send_with_hook(message):
-            if self.before_send is not None:
-                replacement = self.before_send(message)
-                if replacement is not None:
-                    message = replacement
-            send(message)
-
-        server.send = send_with_hook
-        target = self.servers[endpoint]
-        target.handled.clear()
-        target.connections.append(server)
-        target.incoming.put(server)
-        return client
-
-    def close(self) -> None:
-        for server in tuple(self.servers.values()):
-            server.stop()
+                child.close()
+        yield running
+        for process, _ in running:
+            process.join(timeout=45)
+            assert process.exitcode == 0, f"{process.name}: exit={process.exitcode}"
+    finally:
+        survivors = []
+        # These tests start providers before their consumers. Preserve ownership
+        # ordering even when an assertion or communication timeout interrupts them.
+        for process, pipe in reversed(running):
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                if process.is_alive():
+                    survivors.append(process.name)
+                else:
+                    process.close()
+            pipe.close()
+        assert not survivors, f"workers survived cleanup: {survivors}"

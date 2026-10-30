@@ -1,572 +1,448 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
-from __future__ import annotations
+"""Drive the real backend directly: no sockets, server threads or orchestrator."""
 
 import importlib
-import struct
 import threading
 import weakref
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from dataclasses import replace
-from types import ModuleType
+from functools import partial
 
 import msgspec
 import pytest
 
-from tests.distributed.weight_sharing.helpers import (
-    FakeCodec,
-    FakeStorage,
-    FakeTensor,
-    SocketPairTransport,
-    make_context,
-    make_weights,
-)
+from tests.distributed.weight_sharing.helpers import FakeCodec, FakeStorage, FakeTensor, make_context, make_weights
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class Runtime:
-    def __init__(self, package: ModuleType):
+    def __init__(self, package):
         self.api = importlib.import_module(f"{package.__name__}.contracts")
         self.backend = importlib.import_module(f"{package.__name__}.backend")
-        self.channel = importlib.import_module(f"{package.__name__}.channel")
-        self.transport = SocketPairTransport(self.channel)
         self.codec = FakeCodec(self.api)
-        limits = self.channel.Limits(timeout=3)
-        self.provider = self.backend.TorchCudaIpcBackend(codec=self.codec, limits=limits)
-        self.consumer = self.backend.TorchCudaIpcBackend(codec=self.codec, limits=limits)
+        self.provider = self.backend.TorchCudaIpcBackend(codec=self.codec)
+        self.consumer = self.backend.TorchCudaIpcBackend(codec=self.codec)
         self.context = make_context(self.api)
 
-    def publish(self, *, two_storages: bool = False):
+    def publish(self, *, two_storages=False):
         bindings, spec = make_weights(self.api, two_storages=two_storages)
         return bindings, spec, self.provider.prepare_export(bindings, spec, self.context)
 
-    def assert_poisoned_pair(self, exported):
-        assert self.consumer.close_import(self.context.identity.session_id).status == "POISONED"
-        assert self.transport.servers[self.context.endpoint].handled.wait(timeout=3)
-        assert self.provider.release_export(exported).status == "POISONED"
-        assert not self.codec.cancellations
+    def attach(self, spec, exported):
+        bundle = self.provider.claim_export(exported)
+        imported = self.consumer.open_import(bundle, spec, self.context)
+        self.provider.confirm_import(imported.receipt)
+        return bundle, imported
 
-    @contextmanager
-    def failing_operation(self, operation, error_type):
-        error = (error_type or self.api.WeightSharingError)("injected storage operation failure")
-        self.codec.failures[operation] = (2, error)
-        expected = self.api.WeightSharingError if isinstance(error, Exception) else type(error)
-        with pytest.raises(expected) as caught:
-            yield
-        if isinstance(error, Exception):
-            assert caught.value.__cause__ is error
-            assert caught.value.session_id == self.context.identity.session_id
-            assert caught.value.poisoned
-        else:
-            assert caught.value is error
+    def finish(self, exported, imported):
+        result = self.consumer.close_import(imported)
+        assert result.status == "CLOSED" and result.local_complete and not result.peer_confirmed
+        assert result.receipt
+        self.provider.confirm_release(result.receipt)
+        result = self.provider.release_export(exported)
+        assert result.status == "CLOSED" and result.local_complete and result.peer_confirmed
 
 
 @pytest.fixture
-def r(weight_sharing: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
-    runtime = Runtime(weight_sharing)
-    monkeypatch.setattr(runtime.backend, "SessionServer", runtime.transport.server)
-    monkeypatch.setattr(runtime.backend, "connect", runtime.transport.connect)
-    yield runtime
-    runtime.transport.close()
+def r(weight_sharing):
+    return Runtime(weight_sharing)
 
 
-def test_unique_storage_export_and_unexposed_release(r):
-    bindings, spec = make_weights(r.api)
-    owner = threading.get_ident()
-    exported = r.provider.prepare_export(bindings, spec, r.context)
-    snapshot = r.provider.session_status(exported)
-    assert snapshot.state == r.api.SessionState.EXPORTED
-    assert (snapshot.storage_count, snapshot.view_count, snapshot.shared_nbytes) == (1, 3, 32)
-    assert len(r.codec.exports) == 1
-    assert r.provider.release_export(exported).status == "CLOSED"
-    assert r.provider.release_export(exported).status == "CLOSED"
-    assert snapshot.exported_storage_ids == ("storage-0",)
-    assert snapshot.imported_storage_ids == ()
-    assert snapshot.active_storage_id is None
-    assert r.codec.cancellations == ["storage-0"]
-    assert {thread for _, thread in r.codec.calls} == {owner}
-
-
-def test_roundtrip_preserves_views_and_close_is_idempotent(r):
-    bindings, spec = make_weights(r.api)
-    replies = []
-    r.transport.before_send = lambda message: replies.append(message.op)
-    exported = r.provider.prepare_export(bindings, spec, r.context)
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    server = r.transport.servers[r.context.endpoint]
-    assert len(imported) == len(spec.tensors)
-    assert r.provider.session_status(exported).error == ""
-    assert r.consumer.session_status(imported).error == ""
-    assert imported["first"].storage is imported["second"].storage
+@pytest.mark.parametrize("two_storages", [False, True])
+def test_roundtrip_views_receipts_and_local_close_are_distinct(r, two_storages):
+    threads = set(threading.enumerate())
+    bindings, spec, exported = r.publish(two_storages=two_storages)
+    sources = [weakref.ref(value.storage) for value in bindings.values()]
+    del bindings
+    bundle, imported = r.attach(spec, exported)
+    assert type(bundle) is bytes and type(imported.receipt) is bytes
     assert imported["first"].storage is imported["first_alias"].storage
+    assert (imported["first"].storage is imported["second"].storage) is not two_storages
     assert imported["second"].offset_bytes == 16
-    assert imported["first"].storage.data is bindings["first"].storage.data
-    assert r.provider.release_export(exported).status == "HELD"
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    for access in (len, iter, lambda weights: weights["first"]):
-        with pytest.raises(r.api.WeightSharingError, match="closing or closed"):
-            access(imported)
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    assert r.provider.release_export(exported).status == "CLOSED"
-    assert len(server.connections) == 1
-    assert replies == ["manifest", "bundle", "accepted", "released"]
-    assert r.provider.session_status(exported).error == ""
-    assert not r.codec.cancellations
-    provider_status = r.provider.session_status(exported)
-    consumer_status = r.consumer.session_status(imported)
-    assert provider_status.state == consumer_status.state == r.api.SessionState.CLOSED
-    assert provider_status.exported_storage_ids == consumer_status.exported_storage_ids == ("storage-0",)
-    assert consumer_status.imported_storage_ids == ()
-    assert provider_status.active_storage_id is consumer_status.active_storage_id is None
-    assert [name for name, _ in r.codec.calls].count("validate_runtime") == 1
-    assert {thread for _, thread in r.codec.calls} == {threading.get_ident()}
-
-
-@pytest.mark.parametrize("check", ["spec", "validate_runtime", "synchronize"])
-def test_consumer_preflight_failure_does_not_create_session(r, monkeypatch, check):
-    bindings, spec, exported = r.publish()
-    r.codec.calls.clear()
-
-    def reject(context):
-        r.codec._called(check)
-        raise r.api.UnsupportedError("injected preflight failure")
-
-    with monkeypatch.context() as patch:
-        expected = spec
-        if check == "spec":
-            expected = msgspec.structs.replace(spec, tensors=(r.api.TensorSpec("weight", "unknown", (1,)),))
-        else:
-            patch.setattr(r.codec, check, reject)
-        with pytest.raises(r.api.WeightSharingError) as failure:
-            r.consumer.open_import(r.context.endpoint, expected, r.context)
-        assert not failure.value.poisoned
-    expected_calls = {
-        "spec": [],
-        "validate_runtime": ["validate_runtime"],
-        "synchronize": ["validate_runtime", "synchronize"],
-    }
-    assert [name for name, _ in r.codec.calls] == expected_calls[check]
-    with pytest.raises(r.api.WeightSharingError, match="unknown session"):
-        r.consumer.session_status(r.context.identity.session_id)
-    assert not r.transport.servers[r.context.endpoint].connections
-    assert not r.codec.imports
-    assert r.provider.session_status(exported).state == r.api.SessionState.EXPORTED
-    # No session was created: fixing the input/environment permits a first import.
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    assert r.provider.release_export(exported).status == "CLOSED"
-
-
-def test_import_identity_cannot_be_reopened(r):
-    bindings, spec, exported = r.publish()
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    server = r.transport.servers[r.context.endpoint]
-    calls = list(r.codec.calls)
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert r.codec.calls == calls
-    assert len(server.connections) == len(r.codec.imports) == 1
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    calls = list(r.codec.calls)
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert r.codec.calls == calls
-    assert len(server.connections) == len(r.codec.imports) == 1
-    assert r.provider.release_export(exported).status == "CLOSED"
-
-
-def test_provider_shutdown_waits_until_release_ack_is_sent(r, monkeypatch):
-    bindings, spec, exported = r.publish()
-    server = r.transport.servers[r.context.endpoint]
-    control = r.provider._get(exported).control
-    ack_blocked = threading.Event()
-    owner_waiting = threading.Event()
-    allow_ack = threading.Event()
-    original_wait = control.release_complete.wait
-    original_stop = server.stop
-
-    def delay_release_ack(message):
-        if message.op == "released":
-            ack_blocked.set()
-            if not allow_ack.wait(timeout=3):
-                raise r.channel.ChannelError("test did not allow release acknowledgement")
-
-    def observe_owner_wait(timeout=None):
-        owner_waiting.set()
-        return original_wait(timeout)
-
-    def stop_after_ack():
-        assert control.release_complete.is_set(), "Server stopped during release acknowledgement"
-        assert control.peer_released
-        original_stop()
-
-    def import_and_close():
-        imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-        return r.consumer.close_import(imported)
-
-    def unblock_after_owner_waits():
-        assert owner_waiting.wait(timeout=3), "Provider did not wait for release acknowledgement"
-        allow_ack.set()
-
-    r.transport.before_send = delay_release_ack
-    with monkeypatch.context() as patch:
-        patch.setattr(control.release_complete, "wait", observe_owner_wait)
-        patch.setattr(server, "stop", stop_after_ack)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            consumer_result = executor.submit(import_and_close)
-            try:
-                assert ack_blocked.wait(timeout=3), "Consumer did not request release"
-                unblocker = executor.submit(unblock_after_owner_waits)
-                assert r.provider.release_export(exported).status == "CLOSED"
-                unblocker.result(timeout=3)
-                assert consumer_result.result(timeout=3).status == "CLOSED"
-            finally:
-                allow_ack.set()
-    assert owner_waiting.is_set()
-    assert r.provider.session_status(exported).state == r.api.SessionState.CLOSED
-    assert r.consumer.session_status(r.context.identity.session_id).state == r.api.SessionState.CLOSED
-
-
-def test_close_waits_for_external_view_reference(r):
-    bindings, spec, exported = r.publish()
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    held_view = imported["second"]
+    assert imported["first"].storage.data == list(range(8))
+    assert len(r.codec.exports) == 1 + two_storages
+    assert r.provider.session_status(exported).state == r.api.SessionState.ATTACHED
     result = r.consumer.close_import(imported)
-    assert result.status == "HELD"
-    assert not result.local_complete
+    assert result.status == "CLOSED" and not result.peer_confirmed
     assert r.provider.release_export(exported).status == "HELD"
-    del held_view
-    assert r.consumer.close_import(imported).status == "CLOSED"
+    assert all(source() is not None for source in sources)
+    calls = list(r.codec.calls)
+    assert r.consumer.close_import(imported) == result
+    assert r.codec.calls == calls
+    r.provider.confirm_release(result.receipt)
     assert r.provider.release_export(exported).status == "CLOSED"
-    assert all(lease.closed for lease in r.codec.leases)
-
-
-def test_only_owner_can_release_but_other_threads_can_read_status(r):
-    bindings, spec, exported = r.publish()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        snapshot = executor.submit(r.provider.session_status, exported).result(timeout=3)
-        assert snapshot.state == r.api.SessionState.EXPORTED
-        with pytest.raises(r.api.ThreadOwnershipError):
-            executor.submit(r.provider.release_export, exported).result(timeout=3)
+    assert all(source() is None for source in sources)
     assert not r.codec.cancellations
+    for read in (lambda: imported["first"], lambda: iter(imported), lambda: len(imported)):
+        with pytest.raises(r.api.WeightSharingError):
+            read()
+    assert {owner for _, owner in r.codec.calls} == {threading.get_ident()}
+    assert set(threading.enumerate()) == threads
+
+
+def test_external_alias_holds_import_and_provider(r):
+    _, spec, exported = r.publish()
+    _, imported = r.attach(spec, exported)
+    external = imported["first"]
+    result = r.consumer.close_import(imported)
+    assert result == r.api.CloseResult("HELD")
+    assert r.provider.release_export(exported).status == "HELD"
+    assert not r.codec.leases[0].closed
+    del external
+    r.finish(exported, imported)
+    assert r.codec.leases[0].closed
+
+
+def test_unclaimed_export_cancels_once_and_cannot_be_claimed_after_close(r):
+    _, _, exported = r.publish(two_storages=True)
     assert r.provider.release_export(exported).status == "CLOSED"
-
-
-def test_export_does_not_hold_state_lock_during_codec_call(r):
-    bindings, spec = make_weights(r.api)
-    snapshots = []
-    completed = threading.Event()
-
-    def read_snapshot():
-        snapshots.append(r.provider.session_status(r.context.identity.session_id))
-        completed.set()
-
-    def before_export():
-        reader = threading.Thread(target=read_snapshot, daemon=True)
-        reader.start()
-        assert completed.wait(timeout=3), "Status lock was held across the reducer call"
-        reader.join(timeout=3)
-
-    r.codec.before_export = before_export
-    exported = r.provider.prepare_export(bindings, spec, r.context)
-    assert snapshots[0].state == r.api.SessionState.PREPARING
-    assert snapshots[0].active_storage_id == "storage-0"
     assert r.provider.release_export(exported).status == "CLOSED"
+    assert r.codec.cancellations == ["storage-0", "storage-1"]
+    with pytest.raises(r.api.ProtocolError):
+        r.provider.claim_export(exported)
 
 
-@pytest.mark.parametrize("failure_mode", ["send", "truncated", "invalid", "handle", "device"])
-def test_failed_bundle_poisoned_without_retry_or_cancellation(r, failure_mode):
-    bindings, spec = make_weights(r.api, two_storages=True)
-    source_ref = weakref.ref(bindings["first"].storage)
-    exported = r.provider.prepare_export(bindings, spec, r.context)
-    del bindings
-    exposed = []
-    server = r.transport.servers[r.context.endpoint]
+def test_claim_marks_exposure_before_delivery_and_cannot_repeat(r):
+    _, spec, exported = r.publish()
+    bundle = r.provider.claim_export(exported)
+    assert r.provider.session_status(exported).state == r.api.SessionState.CLAIMED
+    with pytest.raises(r.api.ProtocolError):
+        r.provider.claim_export(exported)
+    assert r.provider.release_export(exported).status == "HELD"
+    assert not r.codec.cancellations
+    imported = r.consumer.open_import(bundle, spec, r.context)
+    r.provider.confirm_import(imported.receipt)
+    r.finish(exported, imported)
 
-    def fail_bundle(message):
-        if message.op != "bundle":
-            return None
-        exposed.append(r.provider.session_status(exported))
-        changes: dict[str, dict[str, object]] = {
-            "invalid": {"storage_nbytes": 999},
-            "handle": {"handle": b""},
-            "device": {"device_index": -1},
-        }
-        if failure_mode in changes:
-            descriptor = msgspec.structs.replace(message.exports[1], **changes[failure_mode])
-            return msgspec.structs.replace(message, exports=(message.exports[0], descriptor))
-        if failure_mode == "truncated":
-            # A valid header followed by an incomplete MessagePack payload.
-            server.connections[-1]._socket.sendall(struct.pack("!I", 128) + b"\x81")
-            server.connections[-1].close()
-        raise r.channel.ChannelError("injected bundle delivery failure")
 
-    r.transport.before_send = fail_bundle
-    with pytest.raises(r.api.WeightSharingError) as failure:
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert failure.value.poisoned
-    assert len(exposed) == 1
-    assert exposed[0].exported_storage_ids == ("storage-0", "storage-1")
-    assert exposed[0].active_storage_id is None
+def test_no_reimport_before_or_after_close(r):
+    bindings, spec, exported = r.publish()
+    bundle, imported = r.attach(spec, exported)
+    for closed in (False, True):
+        if closed:
+            r.finish(exported, imported)
+        with pytest.raises(r.api.WeightSharingError, match="reused"):
+            r.consumer.open_import(bundle, spec, r.context)
+        with pytest.raises(r.api.WeightSharingError, match="reused"):
+            r.provider.prepare_export(bindings, spec, r.context)
+    assert len(r.codec.imports) == len(r.codec.exports) == 1
+
+
+def test_receipts_are_idempotent_but_release_cannot_precede_import_confirmation(r):
+    _, spec, exported = r.publish()
+    imported = r.consumer.open_import(r.provider.claim_export(exported), spec, r.context)
+    result = r.consumer.close_import(imported)
+    with pytest.raises(r.api.ProtocolError, match="out of order"):
+        r.provider.confirm_release(result.receipt)
+    r.provider.confirm_import(imported.receipt)
+    r.provider.confirm_import(imported.receipt)
+    r.provider.confirm_release(result.receipt)
+    for closed in (False, True):
+        if closed:
+            r.provider.release_export(exported)
+        before = r.provider.session_status(exported)
+        r.provider.confirm_release(result.receipt)
+        r.provider.confirm_import(imported.receipt)
+        assert r.provider.session_status(exported) == before
+    assert not r.codec.cancellations
+
+
+@pytest.mark.parametrize("mismatch", ["generation", "device_uuid", "rank", "provider_id", "consumer_id", "spec"])
+def test_bundle_mismatch_rejected_without_creating_consumer_resources(r, mismatch):
+    _, spec, exported = r.publish()
+    payload = r.provider.claim_export(exported)
+    context = r.context
+    if mismatch == "spec":
+        spec = msgspec.structs.replace(spec, checkpoint_revision="other")
+    else:
+        changes = {mismatch: 2 if mismatch == "generation" else "other"}
+        if mismatch == "rank":
+            changes = {"rank": 1, "tp_size": 2}
+        context = make_context(r.api, **changes)
+    with pytest.raises(r.api.CompatibilityError):
+        r.consumer.open_import(payload, spec, context)
+    with pytest.raises(r.api.WeightSharingError, match="unknown session"):
+        r.consumer.session_status(context.identity.session_id)
     assert not r.codec.imports
-    r.assert_poisoned_pair(exported)
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert len(server.connections) == 1
-    assert source_ref() is not None
-
-
-def test_lost_import_ack_poisoned_and_rebuild_is_not_repeated(r):
-    bindings, spec, exported = r.publish()
-    server = r.transport.servers[r.context.endpoint]
-
-    def lose_ack(message):
-        if message.op == "accepted":
-            raise r.channel.ChannelError("injected lost import acknowledgement")
-
-    r.transport.before_send = lose_ack
-    with pytest.raises(r.api.WeightSharingError) as failure:
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert failure.value.poisoned
-    assert server.handled.wait(timeout=3)
-    assert r.consumer.session_status(r.context.identity.session_id).state == r.api.SessionState.POISONED
-    assert len(r.codec.imports) == 1
-    assert all(not lease.expired() for lease in r.codec.leases)
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert len(server.connections) == len(r.codec.imports) == 1
-    r.assert_poisoned_pair(exported)
-
-
-@pytest.mark.parametrize("op", ["manifest", "bundle", "accepted", "released"])
-@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, TypeError])
-def test_unexpected_provider_handler_failure_is_queryable(r, op, error_type):
-    bindings, spec, exported = r.publish()
-    source = weakref.ref(bindings["first"].storage)
-    del bindings
-
-    def fail_send(message):
-        if message.op == op:
-            raise error_type("injected unexpected handler failure")
-
-    r.transport.before_send = fail_send
-    with pytest.raises(r.api.WeightSharingError):
-        imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-        r.consumer.close_import(imported)
-    assert r.transport.servers[r.context.endpoint].handled.wait(timeout=3)
-    snapshot = r.provider.session_status(exported)
-    assert snapshot.state == r.api.SessionState.POISONED
-    assert snapshot.error == f"{error_type.__name__}; terminate sharing group"
-    assert source() is not None
+    # A local rejection does not automatically notify the provider.
+    assert r.provider.release_export(exported).status == "HELD"
+    r.provider.mark_failed(exported)
     assert r.provider.release_export(exported).status == "POISONED"
     assert not r.codec.cancellations
 
 
 @pytest.mark.parametrize(
-    "peer_error", ["", "untrusted\nFORGED LOG ENTRY", "x" * 65536], ids=["empty", "multiline", "long"]
+    "field", ["generation", "device_uuid", "rank", "provider_id", "consumer_id", "import_id", "op"]
 )
-def test_peer_error_text_is_not_propagated(r, mocker, peer_error):
-    control = r.backend._Control(r.context)
-    connection = mocker.Mock()
-    connection.recv.return_value = control.message("error", error=peer_error)
-    with pytest.raises(r.api.ProtocolError) as failure:
-        r.backend._receive(control, connection)
-    assert str(failure.value) == "peer rejected the operation"
-    assert failure.value.__cause__ is None
+def test_bad_receipt_cannot_release_or_change_session(r, field):
+    _, spec, exported = r.publish()
+    _, imported = r.attach(spec, exported)
+    receipt = msgspec.msgpack.decode(imported.receipt, type=r.api.SessionReceipt)
+    if field in ("import_id", "op"):
+        receipt = msgspec.structs.replace(receipt, **{field: "other" if field == "import_id" else "released"})
+    else:
+        identity = msgspec.structs.replace(
+            receipt.identity, **{field: 99 if field in ("rank", "generation") else "other"}
+        )
+        receipt = msgspec.structs.replace(receipt, identity=identity)
+    before = r.provider.session_status(exported)
+    with pytest.raises(r.api.ProtocolError):
+        r.provider.confirm_import(msgspec.msgpack.encode(receipt))
+    assert r.provider.session_status(exported) == before
+    r.finish(exported, imported)
 
 
-def test_lost_release_ack_poisoned_without_reconnecting(r):
-    bindings, spec, exported = r.publish()
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    server = r.transport.servers[r.context.endpoint]
-
-    def lose_ack(message):
-        if message.op == "released":
-            raise r.channel.ChannelError("injected lost release acknowledgement")
-
-    r.transport.before_send = lose_ack
-    with pytest.raises(r.api.WeightSharingError) as failure:
-        r.consumer.close_import(imported)
-    assert failure.value.poisoned
-    assert server.handled.wait(timeout=3)
-    calls = list(r.codec.calls)
-    assert r.consumer.close_import(imported).status == "POISONED"
-    assert r.codec.calls == calls
-    assert len(server.connections) == 1
-    assert r.provider.release_export(exported).status == "POISONED"
-
-
-def test_disconnect_is_not_a_release_and_cannot_be_resumed(r):
-    bindings, spec = make_weights(r.api)
-    source_ref = weakref.ref(bindings["first"].storage)
-    exported = r.provider.prepare_export(bindings, spec, r.context)
+@pytest.mark.parametrize("fault", ["delivery", "import_receipt", "release_receipt"])
+def test_uncertain_control_outcome_requires_explicit_failure_and_retains_resources(r, fault):
+    bindings, spec, exported = r.publish(two_storages=True)
+    sources = [weakref.ref(value.storage) for value in bindings.values()]
     del bindings
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    server = r.transport.servers[r.context.endpoint]
-    server.connections[0].close()
-    assert server.handled.wait(timeout=3)
-    assert r.provider.session_status(exported).state == r.api.SessionState.POISONED
-    assert r.provider.release_export(exported).status == "POISONED"
-    assert source_ref() is not None
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    with pytest.raises(r.api.WeightSharingError) as failure:
-        r.consumer.close_import(imported)
-    assert failure.value.poisoned
-    assert len(server.connections) == 1
-    assert not r.codec.cancellations
-    replacement = r.backend.TorchCudaIpcBackend(codec=r.codec)
-    with pytest.raises(r.api.WeightSharingError) as rejected:
-        replacement.open_import(r.context.endpoint, spec, r.context)
-    assert rejected.value.poisoned
-    assert len(r.codec.imports) == 1
-    assert r.provider.session_status(exported).state == r.api.SessionState.POISONED
-
-
-def test_attached_session_can_idle_beyond_operation_timeout(r):
-    limits = r.channel.Limits(timeout=0.2)
-    r.provider._limits = r.consumer._limits = limits
-    bindings, spec, exported = r.publish()
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    server = r.transport.servers[r.context.endpoint]
-    assert not server.handled.wait(timeout=0.4), "Healthy idle session was disconnected"
-    assert r.provider.session_status(exported).state == r.api.SessionState.ATTACHED
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    assert r.provider.release_export(exported).status == "CLOSED"
-
-
-@pytest.mark.parametrize("mismatch", ["generation", "device_uuid", "rank", "token", "spec"])
-def test_handshake_mismatch_never_imports_storage(r, mismatch):
-    bindings, spec, exported = r.publish()
-    context = r.context
-    expected = spec
-    if mismatch == "generation":
-        context = make_context(r.api, generation=2)
-    elif mismatch == "device_uuid":
-        context = make_context(r.api, device_uuid="GPU-other")
-    elif mismatch == "rank":
-        context = make_context(r.api, rank=1, tp_size=2)
-    elif mismatch == "token":
-        context = replace(context, token=b"invalid-token-long-enough")
-    else:
-        expected = msgspec.structs.replace(spec, checkpoint_revision="other-revision")
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(context.endpoint, expected, context)
-    assert r.transport.servers[r.context.endpoint].handled.wait(timeout=3)
-    assert not r.codec.imports
-    assert r.provider.session_status(exported).exported_storage_ids == ("storage-0",)
-    if mismatch == "spec":
-        # Authentication already bound the session before manifest checking.
-        assert r.provider.release_export(exported).status == "POISONED"
-        assert not r.codec.cancellations
-    else:
-        assert r.provider.session_status(exported).state == r.api.SessionState.EXPORTED
-        assert r.provider.release_export(exported).status == "CLOSED"
-        assert len(r.codec.cancellations) == 1
-
-
-def test_empty_storage_has_no_export_descriptor_but_still_requires_peer_release(r):
-    bindings = {"empty": FakeTensor(FakeStorage(0), shape=(0,))}
-    spec = r.api.WeightSpec("model", "revision", "layout", (r.api.TensorSpec("empty", "float32", (0,)),))
-    exported = r.provider.prepare_export(bindings, spec, r.context)
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert imported["empty"].storage.nbytes == 0
-    assert not r.codec.exports
-    snapshot = r.consumer.session_status(imported)
-    assert snapshot.exported_storage_ids == ()
-    assert snapshot.imported_storage_ids == ("storage-0",)
+    payload = r.provider.claim_export(exported)
+    imported = None
+    if fault != "delivery":
+        imported = r.consumer.open_import(payload, spec, r.context)
+        if fault == "release_receipt":
+            r.provider.confirm_import(imported.receipt)
+            assert r.consumer.close_import(imported).local_complete
     assert r.provider.release_export(exported).status == "HELD"
-    assert r.consumer.close_import(imported).status == "CLOSED"
-    assert r.provider.release_export(exported).status == "CLOSED"
+    r.provider.mark_failed(exported)
+    r.provider.mark_failed(exported)
+    assert r.provider.release_export(exported).status == "POISONED"
+    if imported is not None:
+        r.consumer.mark_failed(imported)
+        result = r.consumer.close_import(imported)
+        assert result.status == "POISONED" and result.receipt is None
+        assert result.local_complete == (fault == "release_receipt")
+        with pytest.raises(r.api.ProtocolError):
+            r.provider.confirm_import(imported.receipt)
+        if fault != "release_receipt":
+            assert all(not lease.expired() for lease in r.codec.leases)
+    assert all(source() is not None for source in sources)
+    assert not r.codec.cancellations
 
 
-def test_listener_startup_failure_is_queryable_and_unexposed_counters_cancel(r, monkeypatch):
-    bindings, spec = make_weights(r.api)
-    original = r.transport.server
+@pytest.mark.parametrize("operation", ["export", "import", "cancel"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_partial_device_failure_keeps_active_storage_and_prevents_retry(r, operation, error_type):
+    bindings, spec = make_weights(r.api, two_storages=True)
+    r.codec.failures[operation] = (2, error_type("injected device failure"))
+    backend = r.consumer if operation == "import" else r.provider
+    if operation == "export":
+        invoke = partial(r.provider.prepare_export, bindings, spec, r.context)
+    else:
+        exported = r.provider.prepare_export(bindings, spec, r.context)
+        if operation == "import":
+            payload = r.provider.claim_export(exported)
+            invoke = partial(r.consumer.open_import, payload, spec, r.context)
+        else:
+            invoke = partial(r.provider.release_export, exported)
+    expected = r.api.WeightSharingError if error_type is RuntimeError else error_type
+    with pytest.raises(expected):
+        invoke()
+    session_id = r.context.identity.session_id
+    snapshot = backend.session_status(session_id)
+    assert snapshot.state == r.api.SessionState.POISONED
+    assert snapshot.active_storage_id == "storage-1"
+    if operation == "import":
+        assert snapshot.imported_storage_ids == ("storage-0",)
+        assert all(not lease.expired() for lease in r.codec.leases)
+        assert r.consumer.close_import(session_id).status == "POISONED"
+        with pytest.raises(r.api.WeightSharingError, match="reused"):
+            invoke()
+        r.provider.mark_failed(exported)
+    else:
+        assert r.provider.release_export(session_id).status == "POISONED"
+        if operation == "export":
+            assert snapshot.exported_storage_ids == ("storage-0",)
+    assert len(r.codec.cancellations) == (2 if operation == "cancel" else 0)
+    assert backend.session_status(session_id) == snapshot
 
-    def cannot_listen(*args):
-        server = original(*args)
 
-        def fail_start():
-            raise r.channel.ChannelError("injected listener startup failure")
+@pytest.mark.parametrize("operation", ["validate_runtime", "synchronize"])
+def test_consumer_preflight_failure_needs_no_cleanup(r, monkeypatch, operation):
+    _, spec, exported = r.publish()
+    payload = r.provider.claim_export(exported)
 
-        server.start = fail_start
-        return server
+    def fail(*args):
+        raise r.api.UnsupportedError("preflight failed")
 
-    monkeypatch.setattr(r.backend, "SessionServer", cannot_listen)
-    with pytest.raises(r.api.WeightSharingError) as failure:
-        r.provider.prepare_export(bindings, spec, r.context)
-    assert failure.value.session_id == r.context.identity.session_id
-    assert r.provider.release_export(failure.value.session_id).status == "CLOSED"
-    assert len(r.codec.cancellations) == 1
+    monkeypatch.setattr(r.codec, operation, fail)
+    with pytest.raises(r.api.UnsupportedError):
+        r.consumer.open_import(payload, spec, r.context)
+    with pytest.raises(r.api.WeightSharingError, match="unknown session"):
+        r.consumer.close_import(r.context.identity.session_id)
+    assert not r.codec.imports
 
 
-def test_close_from_wrong_thread_does_not_invalidate_import(r):
-    bindings, spec, exported = r.publish()
-    imported = r.consumer.open_import(r.context.endpoint, spec, r.context)
+@pytest.mark.parametrize("operation", ["make_views", "weak_storage", "synchronize"])
+def test_failure_after_rebuild_retains_imports(r, monkeypatch, operation):
+    _, spec, exported = r.publish()
+    payload = r.provider.claim_export(exported)
+    original = getattr(r.codec, operation)
+
+    def fail(*args):
+        if r.codec.imports:
+            raise RuntimeError("post-import failure")
+        return original(*args)
+
+    monkeypatch.setattr(r.codec, operation, fail)
+    with pytest.raises(r.api.WeightSharingError) as error:
+        r.consumer.open_import(payload, spec, r.context)
+    assert error.value.poisoned
+    snapshot = r.consumer.session_status(r.context.identity.session_id)
+    assert snapshot.imported_storage_ids == ("storage-0",)
+    assert r.consumer.close_import(snapshot.session_id).status == "POISONED"
+
+
+def test_lease_close_failure_cannot_produce_release_receipt(r, monkeypatch):
+    _, spec, exported = r.publish()
+    _, imported = r.attach(spec, exported)
+
+    def fail():
+        raise RuntimeError("mapping close failed")
+
+    monkeypatch.setattr(r.codec.leases[0], "close", fail)
+    with pytest.raises(r.api.WeightSharingError) as error:
+        r.consumer.close_import(imported)
+    assert error.value.poisoned
+    result = r.consumer.close_import(imported)
+    assert result.status == "POISONED" and not result.local_complete and result.receipt is None
+    assert r.provider.release_export(exported).status == "HELD"
+
+
+@pytest.mark.parametrize(
+    "operation", ["claim_export", "release_export", "confirm_import", "confirm_release", "mark_failed", "close_import"]
+)
+def test_mutations_require_owner_thread_but_status_does_not(r, operation):
+    _, spec, exported = r.publish()
+    if operation in ("claim_export", "release_export", "mark_failed"):
+        target, argument = r.provider, exported
+    else:
+        _, imported = r.attach(spec, exported)
+        target, argument = (r.consumer, imported) if operation == "close_import" else (r.provider, imported.receipt)
+        if operation == "confirm_release":
+            argument = r.consumer.close_import(imported).receipt
     with ThreadPoolExecutor(max_workers=1) as executor:
         with pytest.raises(r.api.ThreadOwnershipError):
-            executor.submit(r.consumer.close_import, imported).result(timeout=3)
-    assert imported["first"].shape == (4,)
-    assert r.consumer.close_import(imported).status == "CLOSED"
+            executor.submit(getattr(target, operation), argument).result(timeout=3)
+        snapshot = executor.submit(r.provider.session_status, exported).result(timeout=3)
+    assert snapshot.state != r.api.SessionState.POISONED
+
+
+def test_empty_storage_still_requires_explicit_peer_confirmation(r):
+    spec = r.api.WeightSpec("model", "revision", "layout", (r.api.TensorSpec("empty", "float32", (0,)),))
+    exported = r.provider.prepare_export({"empty": FakeTensor(FakeStorage(0), shape=(0,))}, spec, r.context)
+    _, imported = r.attach(spec, exported)
+    assert imported["empty"].storage.nbytes == 0 and not r.codec.exports
+    assert r.provider.release_export(exported).status == "HELD"
+    r.finish(exported, imported)
+
+
+def test_oversized_export_can_be_cancelled_because_no_bundle_was_returned(r):
+    _, _, exported = r.publish()
+    r.provider._limits = r.api.Limits(max_bundle_bytes=1)
+    with pytest.raises(r.api.ProtocolError, match="size limit"):
+        r.provider.claim_export(exported)
+    assert r.provider.session_status(exported).state == r.api.SessionState.EXPORTED
     assert r.provider.release_export(exported).status == "CLOSED"
+    assert r.codec.cancellations == ["storage-0"]
 
 
-@pytest.mark.parametrize("error_type", [None, KeyboardInterrupt, SystemExit], ids=["error", "interrupt", "exit"])
-def test_partial_export_failure_is_queryable_and_cannot_retry(r, error_type):
-    bindings, spec = make_weights(r.api, two_storages=True)
-    with r.failing_operation("export", error_type):
+@pytest.mark.parametrize("payload", [b"", b"invalid", b"\x81", b"x" * 2049])
+def test_malformed_metadata_is_rejected_before_import(r, payload):
+    _, spec = make_weights(r.api)
+    r.consumer._limits = r.api.Limits(max_bundle_bytes=2048)
+    with pytest.raises(r.api.ProtocolError):
+        r.consumer.open_import(payload, spec, r.context)
+    assert not r.codec.imports
+
+
+@pytest.mark.parametrize(
+    "changes", [{"handle": b""}, {"storage_nbytes": 1}, {"allocation_offset_bytes": -1}, {"ref_counter_handle": b""}]
+)
+def test_all_descriptors_validated_before_any_import(r, changes):
+    _, spec, exported = r.publish(two_storages=True)
+    bundle = msgspec.msgpack.decode(r.provider.claim_export(exported), type=r.api.ExportBundle)
+    bad = msgspec.structs.replace(bundle.exports[1], **changes)
+    payload = msgspec.msgpack.encode(msgspec.structs.replace(bundle, exports=(bundle.exports[0], bad)))
+    with pytest.raises(r.api.CompatibilityError):
+        r.consumer.open_import(payload, spec, r.context)
+    assert not r.codec.imports
+
+
+def _cpu_provider(control):
+    from tests.distributed.weight_sharing.helpers import load_weight_sharing, publish_to_parent, release_from_parent
+
+    runtime = Runtime(load_weight_sharing())
+    _, _, exported = runtime.publish(two_storages=True)
+    publish_to_parent(runtime.provider, exported, control)
+    release_from_parent(runtime.provider, exported, control)
+
+
+def _cpu_consumer(control):
+    from tests.distributed.weight_sharing.helpers import load_weight_sharing, receive
+
+    runtime = Runtime(load_weight_sharing())
+    _, spec = make_weights(runtime.api, two_storages=True)
+    # FakeCodec has no device memory: seed its local stand-in for the two handles.
+    # The real CUDA tests use the same harness with actual reducer/rebuilder calls.
+    runtime.codec.payloads = {f"storage-{i}".encode(): (32, list(range(8))) for i in range(2)}
+    imported = runtime.consumer.open_import(receive(control), spec, runtime.context)
+    control.send(imported.receipt)
+    receive(control, "attached")
+    assert imported["first"].storage.data == list(range(8))
+    external = imported["second"]
+    assert runtime.consumer.close_import(imported).status == "HELD"
+    del external
+    result = runtime.consumer.close_import(imported)
+    assert result.local_complete and not result.peer_confirmed
+    control.send(result.receipt)
+
+
+def test_spawned_metadata_relay_without_omni_or_device_runtime():
+    from tests.distributed.weight_sharing.helpers import relay_import, relay_release, spawn_workers
+
+    with spawn_workers((_cpu_provider, ()), (_cpu_consumer, ())) as workers:
+        (_, provider), (_, consumer) = workers
+        relay_import(provider, consumer)
+        relay_release(provider, consumer)
+
+
+def test_provider_preflight_failure_remains_queryable_and_cancellable(r, monkeypatch):
+    bindings, spec = make_weights(r.api)
+
+    def fail(*args):
+        raise r.api.UnsupportedError("unsupported layout")
+
+    monkeypatch.setattr(r.codec, "inspect", fail)
+    with pytest.raises(r.api.WeightSharingError) as error:
         r.provider.prepare_export(bindings, spec, r.context)
+    assert not error.value.poisoned
+    assert r.provider.session_status(error.value.session_id).error == "UnsupportedError"
+    with pytest.raises(r.api.ProtocolError):
+        r.provider.claim_export(error.value.session_id)
+    assert r.provider.release_export(error.value.session_id).status == "CLOSED"
+    assert not r.codec.exports and not r.codec.cancellations
+
+
+def test_status_query_during_device_operation_does_not_hold_control_lock(r):
+    snapshots = []
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        r.codec.before_export = lambda: snapshots.append(
+            executor.submit(r.provider.session_status, r.context.identity.session_id).result(timeout=3)
+        )
+        _, _, exported = r.publish()
+    assert snapshots[0].active_storage_id == "storage-0"
+    assert r.provider.session_status(exported).active_storage_id is None
+    r.provider.release_export(exported)
+
+
+def test_failure_notification_does_not_erase_original_device_diagnostic(r):
+    r.codec.failures["export"] = (1, RuntimeError("failed reducer"))
+    with pytest.raises(r.api.WeightSharingError):
+        r.publish()
     session_id = r.context.identity.session_id
     snapshot = r.provider.session_status(session_id)
-    assert snapshot.state == r.api.SessionState.POISONED
-    assert snapshot.exported_storage_ids == ("storage-0",)
-    assert snapshot.imported_storage_ids == ()
-    assert snapshot.active_storage_id == "storage-1"
-    # A throwing reducer may have installed another counter before failing.
-    assert r.provider.release_export(session_id).status == "POISONED"
-    assert len(r.codec.exports) == 1
-    assert not r.codec.cancellations
-    with pytest.raises(r.api.WeightSharingError):
-        r.provider.prepare_export(bindings, spec, r.context)
-    assert len(r.codec.exports) == 1
-
-
-@pytest.mark.parametrize("error_type", [None, KeyboardInterrupt, SystemExit], ids=["error", "interrupt", "exit"])
-def test_partial_import_failure_retains_resources_and_cannot_reconsume(r, error_type):
-    bindings, spec, exported = r.publish(two_storages=True)
-    source_refs = tuple(weakref.ref(tensor.storage) for tensor in bindings.values())
-    del bindings
-    with r.failing_operation("import", error_type):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    snapshot = r.consumer.session_status(r.context.identity.session_id)
-    assert snapshot.state == r.api.SessionState.POISONED
-    assert snapshot.exported_storage_ids == ("storage-0", "storage-1")
-    assert snapshot.imported_storage_ids == ("storage-0",)
-    assert snapshot.active_storage_id == "storage-1"
-    assert len(r.codec.imports) == 2
-    assert all(not lease.expired() for lease in r.codec.leases)
-    with pytest.raises(r.api.WeightSharingError):
-        r.consumer.open_import(r.context.endpoint, spec, r.context)
-    assert len(r.codec.imports) == 2
-    # A disconnect cannot establish whether the failed rebuild used its counter.
-    r.assert_poisoned_pair(exported)
-    assert all(reference() is not None for reference in source_refs)
-
-
-@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
-def test_cancel_interrupt_is_not_repeated(r, error_type):
-    bindings, spec, exported = r.publish(two_storages=True)
-    with r.failing_operation("cancel", error_type):
-        r.provider.release_export(exported)
-    snapshot = r.provider.session_status(exported)
-    assert snapshot.state == r.api.SessionState.POISONED
-    assert snapshot.exported_storage_ids == ("storage-0", "storage-1")
-    assert snapshot.active_storage_id == "storage-1"
-    assert len(r.codec.cancellations) == 2
-    assert r.provider.release_export(exported).status == "POISONED"
-    assert len(r.codec.cancellations) == 2
+    r.provider.mark_failed(session_id)
+    assert r.provider.session_status(session_id) == snapshot

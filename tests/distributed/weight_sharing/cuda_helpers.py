@@ -3,16 +3,20 @@
 """Shared process harness for real CUDA tests; pipes carry control messages only."""
 
 import importlib
-import multiprocessing
 import os
 import sys
-from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
 import torch
 
 from tests.distributed.weight_sharing.helpers import load_weight_sharing, make_context
+from tests.distributed.weight_sharing.helpers import publish_to_parent as publish_to_parent
+from tests.distributed.weight_sharing.helpers import receive as receive
+from tests.distributed.weight_sharing.helpers import relay_import as relay_import
+from tests.distributed.weight_sharing.helpers import relay_release as relay_release
+from tests.distributed.weight_sharing.helpers import release_from_parent as release_from_parent
+from tests.distributed.weight_sharing.helpers import spawn_workers as spawn_workers
 
 
 def require_cuda(num_devices=0):
@@ -24,14 +28,13 @@ def require_cuda(num_devices=0):
         pytest.skip(f"CUDA IPC test requires {num_devices} NVIDIA GPU(s)")
 
 
-def runtime(endpoint, *, device_index=0, rank=0, tp_size=1, session_id="session"):
+def runtime(*, device_index=0, rank=0, tp_size=1, session_id="session"):
     package = load_weight_sharing()
     api = importlib.import_module(f"{package.__name__}.contracts")
     backend = importlib.import_module(f"{package.__name__}.backend")
     codec = importlib.import_module(f"{package.__name__}.torch_cuda_ipc_codec")
     context = make_context(
         api,
-        endpoint,
         device_uuid=codec._device_uuid(device_index),
         rank=rank,
         tp_size=tp_size,
@@ -40,14 +43,6 @@ def runtime(endpoint, *, device_index=0, rank=0, tp_size=1, session_id="session"
         session_id=session_id,
     )
     return api, backend.TorchCudaIpcBackend(), replace(context, device_index=device_index)
-
-
-def receive(pipe, expected=None, timeout=45):
-    assert pipe.poll(timeout), f"worker timed out waiting for {expected!r}"
-    message = pipe.recv()
-    if expected is not None:
-        assert message == expected
-    return message
 
 
 def assert_export_allocations(bindings):
@@ -65,45 +60,3 @@ def assert_export_allocations(bindings):
             if segment["address"] <= storage.data_ptr() < segment["address"] + segment["total_size"]
         ]
         assert len(owners) == 1 and owners[0]["is_expandable"] is expandable
-
-
-@contextmanager
-def spawn_workers(*workers):
-    """Start (target, args[, env]) workers, appending their control pipe argument."""
-    context = multiprocessing.get_context("spawn")
-    running = []
-    try:
-        for worker in workers:
-            target, args = worker[:2]
-            parent, child = context.Pipe()
-            process = context.Process(target=target, args=(*args, child))
-            running.append((process, parent))
-            try:
-                with pytest.MonkeyPatch.context() as patch:
-                    for key, value in (worker[2] if len(worker) == 3 else {}).items():
-                        patch.setenv(key, value)
-                    process.start()
-            finally:
-                child.close()
-        yield running
-        for process, _ in running:
-            process.join(timeout=45)
-            assert process.exitcode == 0, f"{process.name}: exit={process.exitcode}"
-    finally:
-        survivors = []
-        # These tests start providers before their consumers. Preserve ownership
-        # ordering even when an assertion or communication timeout interrupts them.
-        for process, pipe in reversed(running):
-            if process.pid is not None:
-                if process.is_alive():
-                    process.terminate()
-                process.join(timeout=5)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
-                if process.is_alive():
-                    survivors.append(process.name)
-                else:
-                    process.close()
-            pipe.close()
-        assert not survivors, f"workers survived cleanup: {survivors}"

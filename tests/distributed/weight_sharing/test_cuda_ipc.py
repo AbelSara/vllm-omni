@@ -13,7 +13,11 @@ import torch
 
 from tests.distributed.weight_sharing.cuda_helpers import (
     assert_export_allocations,
+    publish_to_parent,
     receive,
+    relay_import,
+    relay_release,
+    release_from_parent,
     require_cuda,
     runtime,
     spawn_workers,
@@ -68,8 +72,8 @@ def _assert_released(baseline):
     return current if baseline is None else baseline
 
 
-def _provider(endpoint, rounds, control):
-    api, backend, context = runtime(endpoint)
+def _provider(rounds, control):
+    api, backend, context = runtime()
     baseline = None
     stream = torch.Stream(device="cuda:0")
     spec = _spec(api)
@@ -92,16 +96,18 @@ def _provider(endpoint, rounds, control):
         assert snapshot.storage_count == 6
         assert len(snapshot.exported_storage_ids) == 5
         assert snapshot.active_storage_id is None
-        descriptors = backend._sessions[exported.session_id].control.exports
+        payload = backend.claim_export(exported)
+        descriptors = msgspec.msgpack.decode(payload, type=api.ExportBundle).exports
         # Native allocator suballocations can share one handle, but not offsets.
         assert len({d.handle for d in descriptors}) < len(descriptors)
         assert len({(d.handle, d.allocation_offset_bytes) for d in descriptors}) == len(descriptors)
-        control.send("ready")
-        receive(control, "release")
+        control.send(payload)
+        backend.confirm_import(receive(control))
+        control.send("attached")
+        backend.confirm_release(receive(control))
         assert backend.release_export(exported).status == "CLOSED"
         assert backend.release_export(exported).status == "CLOSED"
         assert backend.session_status(exported).state == api.SessionState.CLOSED
-        assert not Path(endpoint).exists()
         baseline = _assert_released(baseline)
         control.send("closed")
         receive(control, "next")
@@ -126,8 +132,8 @@ def _matmuls(bindings):
     }
 
 
-def _consumer(endpoint, rounds, control):
-    api, backend, context = runtime(endpoint)
+def _consumer(rounds, control):
+    api, backend, context = runtime()
     baseline = None
     stream = torch.Stream(device="cuda:0")
     spec = _spec(api)
@@ -138,12 +144,14 @@ def _consumer(endpoint, rounds, control):
     stream.synchronize()
     del warmup
     for index in range(rounds):
-        receive(control, "import")
+        payload = receive(control)
         iteration = _iteration(context, index)
-        imported = backend.open_import(endpoint, spec, iteration)
+        imported = backend.open_import(payload, spec, iteration)
+        control.send(imported.receipt)
+        receive(control, "attached")
         _check_views(imported)
         with pytest.raises(api.WeightSharingError):
-            backend.open_import(endpoint, spec, iteration)
+            backend.open_import(payload, spec, iteration)
         external_view = imported["transposed"][:, :8]
         external_parameter = torch.nn.Parameter(imported["independent"], requires_grad=False)
         with stream:
@@ -159,28 +167,25 @@ def _consumer(endpoint, rounds, control):
         assert backend.close_import(imported).status == "HELD"
         del external_parameter
         gc.collect()
-        assert backend.close_import(imported).status == "CLOSED"
-        assert backend.close_import(imported).status == "CLOSED"
+        result = backend.close_import(imported)
+        assert result.status == "CLOSED" and result.local_complete and not result.peer_confirmed
+        assert backend.close_import(imported) == result
         assert backend.session_status(imported).imported_storage_ids == ()
         for name, output in outputs.items():
             expected = _bindings("cpu")[name].float().sum(dim=1, keepdim=True).expand(-1, 4)
             torch.testing.assert_close(output.float().cpu(), expected, rtol=0, atol=0)
         del output, outputs
         baseline = _assert_released(baseline)
-        control.send("closed")
+        control.send(result.receipt)
 
 
 @pytest.mark.parametrize("rounds", [1, 50], ids=["roundtrip", "repeated-lifecycle"])
-def test_two_spawned_processes_share_storage_and_return_references(tmp_path: Path, rounds):
-    endpoint = str(tmp_path / "weights.sock")
-    with spawn_workers((_provider, (endpoint, rounds)), (_consumer, (endpoint, rounds))) as workers:
+def test_two_spawned_processes_share_storage_and_return_references(rounds):
+    with spawn_workers((_provider, (rounds,)), (_consumer, (rounds,))) as workers:
         (_, provider), (_, consumer) = workers
         for _ in range(rounds):
-            receive(provider, "ready")
-            consumer.send("import")
-            receive(consumer, "closed")
-            provider.send("release")
-            receive(provider, "closed")
+            relay_import(provider, consumer)
+            relay_release(provider, consumer)
             provider.send("next")
 
 
@@ -188,30 +193,31 @@ def _large_spec(api, nbytes):
     return api.WeightSpec("large-test", "revision", "flat", (api.TensorSpec("weight", "float32", (nbytes // 4,)),))
 
 
-def _large_provider(endpoint, nbytes, control):
-    api, backend, context = runtime(endpoint)
+def _large_provider(nbytes, control):
+    api, backend, context = runtime()
     weights = {"weight": torch.ones(nbytes // 4, device="cuda:0")}
     assert_export_allocations(weights)
     exported = backend.prepare_export(weights, _large_spec(api, nbytes), context)
-    control.send("ready")
-    receive(control, "release")
-    assert backend.release_export(exported).status == "CLOSED"
+    publish_to_parent(backend, exported, control)
+    release_from_parent(backend, exported, control)
 
 
-def _memory_consumer(endpoint, nbytes, control):
-    api, backend, context = runtime(endpoint)
+def _memory_consumer(nbytes, control):
+    api, backend, context = runtime()
     # Warm the context and allocator before measuring. Run on an otherwise idle GPU.
     warmup = torch.ones(1024, device="cuda:0")
     assert_export_allocations({"warmup": warmup})
     torch.accelerator.synchronize(0)
     del warmup
     torch.accelerator.memory.empty_cache()
-    receive(control, "import")
+    payload = receive(control)
     memory = torch.accelerator.memory
     before = memory.memory_allocated(0)
     free_before, _ = memory.get_memory_info(0)
     memory.reset_peak_memory_stats(0)
-    imported = backend.open_import(endpoint, _large_spec(api, nbytes), context)
+    imported = backend.open_import(payload, _large_spec(api, nbytes), context)
+    control.send(imported.receipt)
+    receive(control, "attached")
     free_after, _ = memory.get_memory_info(0)
     peak = memory.max_memory_allocated(0) - before
     # Allow fixed mapping/context overhead, but not a second weight-sized allocation.
@@ -223,25 +229,22 @@ def _memory_consumer(endpoint, nbytes, control):
     copied = memory.memory_allocated(0) - before
     assert copied >= nbytes  # Positive control: this measurement detects a real copy.
     del duplicate
-    assert backend.close_import(imported).status == "CLOSED"
+    result = backend.close_import(imported)
+    assert result.status == "CLOSED"
+    control.send(result.receipt)
     assert memory.memory_allocated(0) == before
     control.send((peak, free_before - free_after, copied))
 
 
 @pytest.mark.parametrize("nbytes", [128 * 1024 * 1024, 256 * 1024 * 1024], ids=["128MiB", "256MiB"])
 @pytest.mark.parametrize("same_allocator", [True, False], ids=["matching", "mixed"])
-def test_import_does_not_allocate_a_second_weight_copy(
-    tmp_path: Path, record_property, nbytes, same_allocator, ipc_allocator
-):
-    endpoint = str(tmp_path / "large.sock")
+def test_import_does_not_allocate_a_second_weight_copy(record_property, nbytes, same_allocator, ipc_allocator):
     consumer_expandable = ipc_allocator if same_allocator else not ipc_allocator
     consumer_env = {"PYTORCH_ALLOC_CONF": f"backend:native,expandable_segments:{consumer_expandable}"}
-    with spawn_workers(
-        (_large_provider, (endpoint, nbytes)), (_memory_consumer, (endpoint, nbytes), consumer_env)
-    ) as workers:
+    with spawn_workers((_large_provider, (nbytes,)), (_memory_consumer, (nbytes,), consumer_env)) as workers:
         (_, provider), (consumer_process, consumer) = workers
-        receive(provider, "ready")
-        consumer.send("import")
+        relay_import(provider, consumer)
+        relay_release(provider, consumer)
         peak, driver_delta, copied = receive(consumer)
         record_property("shared_weight_bytes", nbytes)
         record_property("provider_expandable", ipc_allocator)
@@ -251,11 +254,10 @@ def test_import_does_not_allocate_a_second_weight_copy(
         record_property("copy_control_bytes", copied)
         consumer_process.join(timeout=45)
         assert consumer_process.exitcode == 0
-        provider.send("release")
 
 
-def _unexposed_provider(endpoint, rounds, control):
-    api, backend, context = runtime(endpoint)
+def _unexposed_provider(rounds, control):
+    api, backend, context = runtime()
     weights = {"weight": torch.arange(16, dtype=torch.float32, device="cuda:0")}
     assert_export_allocations(weights)
     spec = api.WeightSpec("m", "r", "l", (api.TensorSpec("weight", "float32", (16,), (1,)),))
@@ -269,6 +271,6 @@ def _unexposed_provider(endpoint, rounds, control):
 
 
 @pytest.mark.parametrize("rounds", [1, 50], ids=["single", "repeated-lifecycle"])
-def test_unexposed_export_is_cancelled_once(tmp_path: Path, rounds):
-    with spawn_workers((_unexposed_provider, (str(tmp_path / "unexposed.sock"), rounds))) as workers:
+def test_unexposed_export_is_cancelled_once(rounds):
+    with spawn_workers((_unexposed_provider, (rounds,))) as workers:
         receive(workers[0][1], "closed")
